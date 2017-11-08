@@ -1,4 +1,4 @@
-extern crate futures;
+#[macro_use] extern crate futures;
 
 #[cfg(feature = "tokio")]
 extern crate tokio_core;

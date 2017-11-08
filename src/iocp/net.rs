@@ -1,6 +1,7 @@
 use ::evloop::{AsRegistrar};
 use ::iocp::{CompletionPort, RemoteHandle, OverlappedTask};
 use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket, NetEventLoop};
+use ::genio::*;
 
 use std::{mem};
 use std::sync::Arc;
@@ -177,6 +178,28 @@ impl GenTcpStream for TcpStream {
     }
 }
 
+impl AsyncRead for TcpStream {
+    type FutureImpl = TcpRead;
+
+    fn read<B: LockedBufferMut>(self, buffer: B) -> Read<B, TcpRead> {
+        Read {
+            buffer: Some(buffer),
+            future: TcpRead { state: TcpReadState::Initial(self.clone()) }
+        }
+    }
+}
+
+impl AsyncWrite for TcpStream {
+    type FutureImpl = TcpWrite;
+
+    fn write<B: LockedBuffer>(self, buffer: B) -> Write<B, TcpWrite> {
+        Write {
+            buffer: Some(buffer),
+            future: TcpWrite { state: TcpWriteState::Initial(self.clone()) }
+        }
+    }
+}
+
 impl GenUdpSocket for UdpSocket {
     type EventLoop = CompletionPort;
 
@@ -344,6 +367,90 @@ impl Future for Connect {
                 Ok(Async::Ready(TcpStream::from_connected_stream(stream)?))
             },
             ConnectState::Error(error) => Err(error),
+        }
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+#[doc(hidden)]
+pub struct TcpWrite {
+    state: TcpWriteState,
+}
+
+enum TcpWriteState {
+    None,
+    Initial(TcpStream),
+    Pending(TcpStream, OverlappedTask),
+}
+
+impl WriteFutureImpl for TcpWrite {
+    type Io = TcpStream;
+
+    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<(TcpStream, usize), Error> {
+        match mem::replace(&mut self.state, TcpWriteState::None) {
+            TcpWriteState::Initial(stream) => {
+                let task = OverlappedTask::new(&stream.inner.evloop);
+                match unsafe { task.clone().for_operation(|overlapped| stream.inner.std.write_overlapped(buffer.as_ref(), overlapped)) }? {
+                    Some(bytes) => Ok(Async::Ready((stream, bytes))),
+                    None => {
+                        self.state = TcpWriteState::Pending(stream, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            TcpWriteState::Pending(stream, task) => {
+                let task = OverlappedTask::new(&stream.inner.evloop);
+                match task.poll_socket(&stream.inner.std)? {
+                    Async::Ready((bytes, _)) => Ok(Async::Ready((stream, bytes))),
+                    Async::NotReady => {
+                        self.state = TcpWriteState::Pending(stream, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            TcpWriteState::None => panic!("future has already completed"),
+        }
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+#[doc(hidden)]
+pub struct TcpRead {
+    state: TcpReadState,
+}
+
+enum TcpReadState {
+    None,
+    Initial(TcpStream),
+    Pending(TcpStream, OverlappedTask),
+}
+
+impl ReadFutureImpl for TcpRead {
+    type Io = TcpStream;
+    
+    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(TcpStream, usize), Error> {
+        match mem::replace(&mut self.state, TcpReadState::None) {
+            TcpReadState::Initial(stream) => {
+                let task = OverlappedTask::new(&stream.inner.evloop);
+                match unsafe { task.clone().for_operation(|overlapped| stream.inner.std.read_overlapped(buffer.as_mut(), overlapped)) }? {
+                    Some(bytes) => Ok(Async::Ready((stream, bytes))),
+                    None => {
+                        self.state = TcpReadState::Pending(stream, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            TcpReadState::Pending(stream, task) => {
+                let task = OverlappedTask::new(&stream.inner.evloop);
+                match task.poll_socket(&stream.inner.std)? {
+                    Async::Ready((bytes, _)) => Ok(Async::Ready((stream, bytes))),
+                    Async::NotReady => {
+                        self.state = TcpReadState::Pending(stream, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            TcpReadState::None => panic!("future has already completed"),
         }
     }
 }

@@ -1,10 +1,11 @@
 use ::evloop::{EventLoop, LocalHandle, RemoteHandle, Registrar, AsRegistrar};
 use ::net::{TcpStream as GenTcpStream, TcpListener as GenTcpListener, UdpSocket as GenUdpSocket, NetEventLoop};
+use ::genio::*;
 
 use std::{mem, io};
 use std::sync::Arc;
 use std::time::Duration;
-use std::io::{Error, Result};
+use std::io::{Error, Result, Read as IoRead, Write as IoWrite};
 use std::net::{SocketAddr, TcpStream as StdTcpStream, TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
 
 use futures;
@@ -145,6 +146,32 @@ impl GenTcpStream for TcpStream {
     }
 
     fn local_addr(&self) -> Result<SocketAddr> { self.inner.get_ref().local_addr() }
+}
+
+impl AsyncRead for TcpStream {
+    type FutureImpl = TcpRead;
+
+    fn read<B: LockedBufferMut>(self, buffer: B) -> Read<B, TcpRead> {
+        Read {
+            buffer: Some(buffer),
+            future: TcpRead {
+                state: TcpReadState::Pending(self.clone())
+            }
+        }
+    }
+}
+
+impl AsyncWrite for TcpStream {
+    type FutureImpl = TcpWrite;
+
+    fn write<B: LockedBuffer>(self, buffer: B) -> Write<B, TcpWrite> {
+        Write {
+            buffer: Some(buffer),
+            future: TcpWrite {
+                state: TcpWriteState::Pending(self.clone())
+            }
+        }
+    }
 }
 
 impl GenTcpListener for TcpListener {
@@ -295,6 +322,102 @@ impl Future for Accept {
                 }
             },
             AcceptState::None => panic!("future has already completed"),
+        }
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+#[doc(hidden)]
+pub struct TcpWrite {
+    state: TcpWriteState,
+}
+
+enum TcpWriteState {
+    None,
+    Pending(TcpStream),
+}
+
+impl WriteFutureImpl for TcpWrite {
+    type Io = TcpStream;
+
+    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<(TcpStream, usize), Error> {
+        let bytes = match self.state {
+            TcpWriteState::Pending(ref stream) => {
+                if let Async::NotReady = stream.inner.poll_write() {
+                    return Ok(Async::NotReady);
+                }
+                match stream.inner.get_ref().write(buffer.as_ref()) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        stream.inner.need_write();
+                        return Ok(Async::NotReady);
+                    },
+                    Err(err) => Err(err),
+                }
+            },
+            TcpWriteState::None => panic!("future has already completed"),
+        };
+
+        match bytes {
+            Ok(bytes) => {
+                if let TcpWriteState::Pending(stream) = mem::replace(&mut self.state, TcpWriteState::None) {
+                    Ok(Async::Ready((stream, bytes)))
+                } else {
+                    unreachable!()
+                }
+            },
+            Err(err) => {
+                self.state = TcpWriteState::None;
+                Err(err)
+            },
+        }
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+#[doc(hidden)]
+pub struct TcpRead {
+    state: TcpReadState,
+}
+
+enum TcpReadState {
+    None,
+    Pending(TcpStream),
+}
+
+impl ReadFutureImpl for TcpRead {
+    type Io = TcpStream;
+
+    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(TcpStream, usize), Error> {
+        let bytes = match self.state {
+            TcpReadState::Pending(ref stream) => {
+                if let Async::NotReady = stream.inner.poll_read() {
+                    return Ok(Async::NotReady);
+                }
+                match stream.inner.get_ref().read(buffer.as_mut()) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        stream.inner.need_read();
+                        return Ok(Async::NotReady);
+                    },
+                    Err(err) => Err(err),
+                }
+            },
+            TcpReadState::None => panic!("future has already completed"),
+        };
+
+        match bytes {
+            Ok(bytes) => {
+                if let TcpReadState::Pending(stream) = mem::replace(&mut self.state, TcpReadState::None) {
+                    Ok(Async::Ready((stream, bytes)))
+                } else {
+                    unreachable!()
+                }
+            },
+            Err(err) => {
+                self.state = TcpReadState::None;
+                Err(err)
+            },
         }
     }
 }

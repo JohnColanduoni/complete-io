@@ -205,7 +205,7 @@ impl AsRegistrar<CompletionPort> for RemoteHandle {
 
 /// Allows overlapped IO operations to `notify` tasks.
 /// 
-/// This structure need only be used for adding bindings to additional objects capable
+/// This structure need only be used when adding bindings to additional objects capable
 /// of overlapped IO. When passed to Windows APIs like `WSASend` or `ReadFile`, this
 /// overlapped will ensure the given task is notified when the operation completes. Note
 /// that you must ensure the IO object is added to the IOCP prior, or no notifications will
@@ -440,6 +440,8 @@ impl Inner {
                     }
                 },
                 FUTURE_NOTIFY_IOCP_TOKEN => {
+                    // TODO: if notify acts on an OverlappedSpawn, move directly to polling that future. Otherwise every IO call
+                    // bounces off the IOCP twice.
                     let overlapped_task = OverlappedTask(completion.overlapped() as *const _OverlappedTask);
                     overlapped_task.inner().task.notify();
                 },

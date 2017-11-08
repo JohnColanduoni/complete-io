@@ -1,4 +1,5 @@
 use ::evloop::{EventLoop, ConcurrentEventLoop, AsRegistrar};
+use ::genio::{AsyncRead, AsyncWrite};
 
 use std::io::{Error, Result};
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
@@ -25,7 +26,7 @@ pub trait TcpListener: Sized + Clone {
     fn local_addr(&self) -> Result<SocketAddr>;
 }
 
-pub trait TcpStream: Sized + Clone {
+pub trait TcpStream: Sized + AsyncRead + AsyncWrite + Clone {
     type EventLoop: EventLoop;
 
     type Connect: Future<Item = Self, Error = Error>;
@@ -133,5 +134,32 @@ macro_rules! make_net_tests {
             })).unwrap();
             assert_eq!(SocketAddr::V6(SocketAddrV6::new(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped(), client_side.local_addr().unwrap().port(), 0, 0)), remote_addr);
         }
+
+        #[test]
+        fn tcp_echo() {
+            let mut evloop = $make_evloop;
+            let handle = evloop.handle();
+            let listener = TcpListener::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
+            let mut listener_addr = listener.local_addr().unwrap();
+            listener_addr.set_ip("127.0.0.1".parse().unwrap());
+            evloop.run(future::lazy(|| {
+                let accepted = listener.accept();
+                let connected = TcpStream::connect(&listener_addr, &handle);
+                accepted.join(connected).and_then(|((server, _), client)| {
+                    let message = "hello";
+                    let client_fut = 
+                        client
+                            .write(message.to_string().into_bytes())
+                            .and_then(|(client, buffer, bytes)| client.read(buffer));
+                    let server_fut =
+                        server
+                            .read(vec![0u8; message.len()])
+                            .and_then(|(server, buffer, bytes)| server.write(buffer));
+
+                    client_fut.join(server_fut)
+                })
+            })).unwrap();
+        }
+
     }
 } 
