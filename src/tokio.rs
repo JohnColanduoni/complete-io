@@ -1,6 +1,6 @@
 use ::evloop::{EventLoop, LocalHandle, RemoteHandle, Registrar, AsRegistrar};
-use ::net::{TcpStream as GenTcpStream, TcpListener as GenTcpListener, UdpSocket as GenUdpSocket, NetEventLoop, SendTo, RecvFrom};
-use ::genio::*;
+use ::net::{NetEventLoop, SendTo, RecvFrom};
+use ::io::*;
 
 use std::{mem, io};
 use std::sync::Arc;
@@ -117,7 +117,7 @@ pub struct UdpSocket {
     inner: Arc<PollEvented<MioUdpSocket>>,
 }
 
-impl GenTcpStream for TcpStream {
+impl ::net::TcpStream for TcpStream {
     type EventLoop = Core;
 
     type Connect = Connect;
@@ -174,7 +174,7 @@ impl AsyncWrite for TcpStream {
     }
 }
 
-impl GenTcpListener for TcpListener {
+impl ::net::TcpListener for TcpListener {
     type EventLoop = Core;
     type TcpStream = TcpStream;
 
@@ -200,7 +200,7 @@ impl GenTcpListener for TcpListener {
     fn local_addr(&self) -> Result<SocketAddr> { self.inner.get_ref().local_addr() }
 }
 
-impl GenUdpSocket for UdpSocket {
+impl ::net::UdpSocket for UdpSocket {
     type EventLoop = Core;
 
     type SendToFutureImpl = SendToImpl;

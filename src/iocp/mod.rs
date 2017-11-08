@@ -1,7 +1,7 @@
 pub mod net;
 
-use ::evloop::{EventLoop as GenEventLoop, ConcurrentEventLoop, LocalHandle as GenLocalHandle, RemoteHandle as GenRemoteHandle};
-use ::evloop::{Registrar, AsRegistrar};
+use ::evloop::{Registrar, AsRegistrar, EventLoop, ConcurrentEventLoop};
+use ::evloop::{LocalHandle as GenLocalHandle};
 
 use std::{io, mem};
 use std::marker::PhantomData;
@@ -51,7 +51,7 @@ impl CompletionPort {
     }
 }
 
-impl GenEventLoop for CompletionPort {
+impl EventLoop for CompletionPort {
     type LocalHandle = LocalHandle;
     type RemoteHandle = RemoteHandle;
     type Registrar = RemoteHandle;
@@ -103,7 +103,10 @@ impl ConcurrentEventLoop for CompletionPort {
     }
 }
 
-impl GenLocalHandle for LocalHandle {
+impl ::net::ConcurrentNetEventLoop for CompletionPort {
+}
+
+impl ::evloop::LocalHandle for LocalHandle {
     type EventLoop = CompletionPort;
 
     fn remote(&self) -> &RemoteHandle {
@@ -137,7 +140,7 @@ impl RemoteHandle {
     }
 }
 
-impl GenRemoteHandle for RemoteHandle {
+impl ::evloop::RemoteHandle for RemoteHandle {
     type EventLoop = CompletionPort;
 
     fn local(&self) -> Option<LocalHandle> {
@@ -267,7 +270,7 @@ impl OverlappedTask {
     /// This consumes the `OverlappedTask` because a reference to it will be placed in the IOCP when the
     /// operation is complete. Only one operation may be active for a given OverlappedTask at a time.
     #[inline]
-    pub fn for_operation<F, R>(self, f: F) -> io::Result<R>
+    pub unsafe fn for_operation<F, R>(self, f: F) -> io::Result<R>
         where F: FnOnce(*mut OVERLAPPED) -> io::Result<R>
     {
         let overlapped = self.inner().overlapped.raw();
@@ -628,7 +631,7 @@ thread_local! {
 // wait, and the APC will cause it to wake up.
 //
 // All notifications will have an Arc<_LocalSpawn>, but there should only ever be one LocalSpawn.
-pub struct LocalSpawn(Arc<_LocalSpawn>);
+struct LocalSpawn(Arc<_LocalSpawn>);
 
 struct _LocalSpawn {
     thread: WinHandle,

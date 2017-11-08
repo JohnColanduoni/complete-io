@@ -89,6 +89,9 @@ pub trait IoReadFutureImpl: IoFutureImpl {
     fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<Self::Item, Error>;
 }
 
+/// This is an unfortune kludge required because generic functions in traits
+/// can not return values whose type depends on generic types at the function level.
+#[doc(hidden)]
 pub trait IoWriteFutureImpl: IoFutureImpl {
     type Item: Sized;
 

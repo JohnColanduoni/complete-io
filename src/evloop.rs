@@ -74,10 +74,6 @@ pub trait LocalHandle: Sized + Clone + 'static {
 }
 
 /// An `EventLoop` handle which is free to migrate to diffent specific EventLoop threads.
-/// 
-/// All futures spawned onto the EventLoop will never leave the current thread, which
-/// allows them to not implement `Send`. If this restriction is not required, you may
-/// want to use `RemoteHandle` which may be more efficient on a multithreaded event loops.
 pub trait RemoteHandle: Sized + Clone + Send + 'static {
     type EventLoop: EventLoop;
 

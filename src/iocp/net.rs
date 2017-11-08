@@ -1,7 +1,7 @@
 use ::evloop::{AsRegistrar};
 use ::iocp::{CompletionPort, RemoteHandle, OverlappedTask};
-use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket, NetEventLoop, SendTo, RecvFrom};
-use ::genio::*;
+use ::net::{NetEventLoop, SendTo, RecvFrom};
+use ::io::*;
 
 use std::{mem, io};
 use std::sync::Arc;
@@ -52,7 +52,7 @@ struct _UdpSocket {
     evloop: RemoteHandle,
 }
 
-impl GenTcpListener for TcpListener {
+impl ::net::TcpListener for TcpListener {
     type EventLoop = CompletionPort;
     type TcpStream = TcpStream;
     type Accept = Accept;
@@ -132,7 +132,7 @@ impl TcpStream {
     }
 }
 
-impl GenTcpStream for TcpStream {
+impl ::net::TcpStream for TcpStream {
     type EventLoop = CompletionPort;
 
     type Connect = Connect;
@@ -200,7 +200,7 @@ impl AsyncWrite for TcpStream {
     }
 }
 
-impl GenUdpSocket for UdpSocket {
+impl ::net::UdpSocket for UdpSocket {
     type EventLoop = CompletionPort;
 
     type RecvFromFutureImpl = RecvFromImpl;

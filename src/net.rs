@@ -1,5 +1,5 @@
 use ::evloop::{EventLoop, ConcurrentEventLoop, AsRegistrar};
-use ::genio::*;
+use ::io::*;
 
 use std::{mem};
 use std::io::{Error, Result};
@@ -162,6 +162,7 @@ macro_rules! make_net_tests {
     ($make_evloop:expr) => {
         #[allow(unused)]
         use ::evloop::{EventLoop};
+        use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket};
 
         use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr};
 

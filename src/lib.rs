@@ -21,7 +21,7 @@ extern crate net2;
 
 pub mod evloop;
 #[macro_use] pub mod net;
-mod genio;
+pub mod io;
 
 #[cfg(feature = "tokio")]
 pub mod tokio;
@@ -30,4 +30,4 @@ pub mod tokio;
 pub mod iocp;
 
 pub use evloop::{EventLoop, ConcurrentEventLoop};
-pub use genio::*;
+pub use io::{AsyncRead, AsyncWrite};
