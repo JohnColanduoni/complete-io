@@ -1,4 +1,5 @@
 #[macro_use] extern crate futures;
+#[macro_use] extern crate log;
 
 #[cfg(feature = "tokio")]
 extern crate tokio_core;

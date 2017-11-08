@@ -4,6 +4,7 @@ version = "0.1.0"
 
 [dependencies]
 futures = "^0.1.17"
+log = "^0.3"
 tokio-core = { version = "^0.1.10", optional = true }
 mio = { version = "^0.6.11", optional = true }
 net2 = { version = "^0.2.31", optional = true }

@@ -1,9 +1,9 @@
 use ::evloop::{AsRegistrar};
 use ::iocp::{CompletionPort, RemoteHandle, OverlappedTask};
-use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket, NetEventLoop};
+use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket, NetEventLoop, SendTo, RecvFrom};
 use ::genio::*;
 
-use std::{mem};
+use std::{mem, io};
 use std::sync::Arc;
 use std::io::{Error, Result};
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
@@ -49,7 +49,7 @@ pub struct UdpSocket {
 
 struct _UdpSocket {
     std: StdUdpSocket,
-    _evloop: RemoteHandle,
+    evloop: RemoteHandle,
 }
 
 impl GenTcpListener for TcpListener {
@@ -203,6 +203,9 @@ impl AsyncWrite for TcpStream {
 impl GenUdpSocket for UdpSocket {
     type EventLoop = CompletionPort;
 
+    type RecvFromFutureImpl = RecvFromImpl;
+    type SendToFutureImpl = SendToImpl;
+
     fn from_socket<R>(socket: StdUdpSocket, handle: &R) -> Result<Self> where
         R: AsRegistrar<Self::EventLoop>,
     {
@@ -212,7 +215,7 @@ impl GenUdpSocket for UdpSocket {
         Ok(UdpSocket {
             inner: Arc::new(_UdpSocket {
                 std: socket,
-                _evloop: handle.clone(),
+                evloop: handle.clone(),
             })
         })
     }
@@ -223,6 +226,24 @@ impl GenUdpSocket for UdpSocket {
 
     fn connect(&self, addr: &SocketAddr) -> Result<()> {
         self.inner.std.connect(addr)
+    }
+
+    fn send_to<B: LockedBuffer>(self, buffer: B, addr: &SocketAddr) -> SendTo<B, SendToImpl> {
+        SendTo {
+            buffer: Some(buffer),
+            future: SendToImpl {
+                state: SendToState::Initial(self, addr.clone()),
+            },
+        }
+    }
+
+    fn recv_from<B: LockedBufferMut>(self, buffer: B) -> RecvFrom<B, RecvFromImpl> {
+        RecvFrom {
+            buffer: Some(buffer),
+            future: RecvFromImpl {
+                state: RecvFromState::Initial(self),
+            },
+        }
     }
 }
 
@@ -383,8 +404,14 @@ enum TcpWriteState {
     Pending(TcpStream, OverlappedTask),
 }
 
-impl WriteFutureImpl for TcpWrite {
-    type Io = TcpStream;
+impl IoFutureImpl for TcpWrite {
+    fn cancel(&mut self) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+impl IoWriteFutureImpl for TcpWrite {
+    type Item = (TcpStream, usize);
 
     fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<(TcpStream, usize), Error> {
         match mem::replace(&mut self.state, TcpWriteState::None) {
@@ -399,7 +426,7 @@ impl WriteFutureImpl for TcpWrite {
                 }
             },
             TcpWriteState::Pending(stream, task) => {
-                let task = OverlappedTask::new(&stream.inner.evloop);
+                task.register();
                 match task.poll_socket(&stream.inner.std)? {
                     Async::Ready((bytes, _)) => Ok(Async::Ready((stream, bytes))),
                     Async::NotReady => {
@@ -425,8 +452,14 @@ enum TcpReadState {
     Pending(TcpStream, OverlappedTask),
 }
 
-impl ReadFutureImpl for TcpRead {
-    type Io = TcpStream;
+impl IoFutureImpl for TcpRead {
+    fn cancel(&mut self) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+impl IoReadFutureImpl for TcpRead {
+    type Item = (TcpStream, usize);
     
     fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(TcpStream, usize), Error> {
         match mem::replace(&mut self.state, TcpReadState::None) {
@@ -441,7 +474,7 @@ impl ReadFutureImpl for TcpRead {
                 }
             },
             TcpReadState::Pending(stream, task) => {
-                let task = OverlappedTask::new(&stream.inner.evloop);
+                task.register();
                 match task.poll_socket(&stream.inner.std)? {
                     Async::Ready((bytes, _)) => Ok(Async::Ready((stream, bytes))),
                     Async::NotReady => {
@@ -451,6 +484,114 @@ impl ReadFutureImpl for TcpRead {
                 }
             },
             TcpReadState::None => panic!("future has already completed"),
+        }
+    }
+}
+
+
+#[doc(hidden)]
+pub struct RecvFromImpl {
+    state: RecvFromState,
+}
+
+enum RecvFromState {
+    None,
+    Initial(UdpSocket),
+    Pending(UdpSocket, Box<SocketAddrBuf>, OverlappedTask),
+}
+
+impl IoFutureImpl for RecvFromImpl {
+    fn cancel(&mut self) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+impl IoReadFutureImpl for RecvFromImpl {
+    type Item = (UdpSocket, usize, SocketAddr);
+    
+    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(UdpSocket, usize, SocketAddr), Error> {
+        match mem::replace(&mut self.state, RecvFromState::None) {
+            RecvFromState::Initial(socket) => {
+                let task = OverlappedTask::new(&socket.inner.evloop);
+                let mut addr_buf = Box::new(SocketAddrBuf::new());
+                match unsafe { task.clone().for_operation(|overlapped| socket.inner.std.recv_from_overlapped(buffer.as_mut(), &mut *addr_buf, overlapped)) }? {
+                    Some(bytes) => Ok(Async::Ready((socket, bytes, addr_buf.to_socket_addr().unwrap()))),
+                    None => {
+                        self.state = RecvFromState::Pending(socket, addr_buf, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            RecvFromState::Pending(socket, addr_buf, task) => {
+                task.register();
+                match task.poll_socket(&socket.inner.std)? {
+                    Async::Ready((bytes, _)) => Ok(Async::Ready((socket, bytes, addr_buf.to_socket_addr().unwrap()))),
+                    Async::NotReady => {
+                        self.state = RecvFromState::Pending(socket, addr_buf, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            RecvFromState::None => panic!("future has already completed"),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct SendToImpl {
+    state: SendToState,
+}
+
+enum SendToState {
+    None,
+    Initial(UdpSocket, SocketAddr),
+    Pending(UdpSocket, OverlappedTask),
+}
+
+impl IoFutureImpl for SendToImpl {
+    fn cancel(&mut self) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+impl IoWriteFutureImpl for SendToImpl {
+    type Item = UdpSocket;
+    
+    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<UdpSocket, Error> {
+        match mem::replace(&mut self.state, SendToState::None) {
+            SendToState::Initial(socket, addr) => {
+                let task = OverlappedTask::new(&socket.inner.evloop);
+                match unsafe { task.clone().for_operation(|overlapped| socket.inner.std.send_to_overlapped(buffer.as_ref(), &addr, overlapped)) }? {
+                    Some(bytes) => {
+                        if bytes == buffer.as_ref().len() {
+                            Ok(Async::Ready(socket))
+                        } else {
+                            Err(io::ErrorKind::WriteZero.into())
+                        }
+                    },
+                    None => {
+                        self.state = SendToState::Pending(socket, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            SendToState::Pending(socket, task) => {
+                task.register();
+                match task.poll_socket(&socket.inner.std)? {
+                    Async::Ready((bytes, _)) => {
+                        if bytes == buffer.as_ref().len() {
+                            Ok(Async::Ready(socket))
+                        } else {
+                            Err(io::ErrorKind::WriteZero.into())
+                        }
+                    },
+                    Async::NotReady => {
+                        self.state = SendToState::Pending(socket, task);
+                        Ok(Async::NotReady)
+                    },
+                }
+            },
+            SendToState::None => panic!("future has already completed"),
         }
     }
 }

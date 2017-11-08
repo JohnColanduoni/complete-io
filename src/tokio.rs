@@ -1,5 +1,5 @@
 use ::evloop::{EventLoop, LocalHandle, RemoteHandle, Registrar, AsRegistrar};
-use ::net::{TcpStream as GenTcpStream, TcpListener as GenTcpListener, UdpSocket as GenUdpSocket, NetEventLoop};
+use ::net::{TcpStream as GenTcpStream, TcpListener as GenTcpListener, UdpSocket as GenUdpSocket, NetEventLoop, SendTo, RecvFrom};
 use ::genio::*;
 
 use std::{mem, io};
@@ -203,6 +203,9 @@ impl GenTcpListener for TcpListener {
 impl GenUdpSocket for UdpSocket {
     type EventLoop = Core;
 
+    type SendToFutureImpl = SendToImpl;
+    type RecvFromFutureImpl = RecvFromImpl;
+
     fn from_socket<R>(socket: StdUdpSocket, handle: &R) -> Result<Self> where
         R: AsRegistrar<Core>,
     {
@@ -220,6 +223,24 @@ impl GenUdpSocket for UdpSocket {
 
     fn connect(&self, addr: &SocketAddr) -> Result<()> {
         self.inner.get_ref().connect(addr.clone())
+    }
+
+    fn send_to<B: LockedBuffer>(self, buffer: B, addr: &SocketAddr) -> SendTo<B, SendToImpl> {
+        SendTo {
+            buffer: Some(buffer),
+            future: SendToImpl {
+                state: SendToState::Pending(self, addr.clone()),
+            },
+        }
+    }
+
+    fn recv_from<B: LockedBufferMut>(self, buffer: B) -> RecvFrom<B, RecvFromImpl> {
+        RecvFrom {
+            buffer: Some(buffer),
+            future: RecvFromImpl {
+                state: RecvFromState::Pending(self),
+            },
+        }
     }
 }
 
@@ -337,8 +358,11 @@ enum TcpWriteState {
     Pending(TcpStream),
 }
 
-impl WriteFutureImpl for TcpWrite {
-    type Io = TcpStream;
+impl IoFutureImpl for TcpWrite {
+}
+
+impl IoWriteFutureImpl for TcpWrite {
+    type Item = (TcpStream, usize);
 
     fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<(TcpStream, usize), Error> {
         let bytes = match self.state {
@@ -385,8 +409,11 @@ enum TcpReadState {
     Pending(TcpStream),
 }
 
-impl ReadFutureImpl for TcpRead {
-    type Io = TcpStream;
+impl IoFutureImpl for TcpRead {
+}
+
+impl IoReadFutureImpl for TcpRead {
+    type Item = (TcpStream, usize);
 
     fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(TcpStream, usize), Error> {
         let bytes = match self.state {
@@ -416,6 +443,110 @@ impl ReadFutureImpl for TcpRead {
             },
             Err(err) => {
                 self.state = TcpReadState::None;
+                Err(err)
+            },
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct RecvFromImpl {
+    state: RecvFromState,
+}
+
+enum RecvFromState {
+    None,
+    Pending(UdpSocket),
+}
+
+impl IoFutureImpl for RecvFromImpl {
+}
+
+impl IoReadFutureImpl for RecvFromImpl {
+    type Item = (UdpSocket, usize, SocketAddr);
+    
+    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(UdpSocket, usize, SocketAddr), Error> {
+        let result = match self.state {
+            RecvFromState::Pending(ref socket) => {
+                if let Async::NotReady = socket.inner.poll_read() {
+                    return Ok(Async::NotReady);
+                }
+                match socket.inner.get_ref().recv_from(buffer.as_mut()) {
+                    Ok((bytes, remote_addr)) => Ok((bytes, remote_addr)),
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        socket.inner.need_read();
+                        return Ok(Async::NotReady);
+                    },
+                    Err(err) => Err(err),
+                }
+            },
+            RecvFromState::None => panic!("future has already completed"),
+        };
+
+        match result {
+            Ok((bytes, addr)) => {
+                if let RecvFromState::Pending(socket) = mem::replace(&mut self.state, RecvFromState::None) {
+                    Ok(Async::Ready((socket, bytes, addr)))
+                } else {
+                    unreachable!()
+                }
+            },
+            Err(err) => {
+                self.state = RecvFromState::None;
+                Err(err)
+            },
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct SendToImpl {
+    state: SendToState,
+}
+
+enum SendToState {
+    None,
+    Pending(UdpSocket, SocketAddr),
+}
+
+impl IoFutureImpl for SendToImpl {
+}
+
+impl IoWriteFutureImpl for SendToImpl {
+    type Item = UdpSocket;
+    
+    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<UdpSocket, Error> {
+        let result = match self.state {
+            SendToState::Pending(ref socket, ref addr) => {
+                if let Async::NotReady = socket.inner.poll_write() {
+                    return Ok(Async::NotReady);
+                }
+                match socket.inner.get_ref().send_to(buffer.as_ref(), addr) {
+                    Ok(bytes) => if bytes == buffer.as_ref().len() {
+                        Ok(())
+                    } else {
+                        Err(io::ErrorKind::WriteZero.into())
+                    },
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        socket.inner.need_write();
+                        return Ok(Async::NotReady);
+                    },
+                    Err(err) => Err(err),
+                }
+            },
+            SendToState::None => panic!("future has already completed"),
+        };
+
+        match result {
+            Ok(()) => {
+                if let SendToState::Pending(socket, _) = mem::replace(&mut self.state, SendToState::None) {
+                    Ok(Async::Ready(socket))
+                } else {
+                    unreachable!()
+                }
+            },
+            Err(err) => {
+                self.state = SendToState::None;
                 Err(err)
             },
         }
