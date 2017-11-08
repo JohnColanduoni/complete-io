@@ -1,10 +1,9 @@
 use ::evloop::{AsRegistrar};
-use ::iocp::{CompletionPort, RemoteHandle, OverlappedTask, Inner};
+use ::iocp::{CompletionPort, RemoteHandle, OverlappedTask};
 use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket, NetEventLoop};
 
-use std::{mem, ptr};
+use std::{mem};
 use std::sync::Arc;
-use std::sync::atomic::{Ordering, AtomicUsize, ATOMIC_USIZE_INIT};
 use std::io::{Error, Result};
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
 use std::os::windows::prelude::*;
@@ -49,7 +48,7 @@ pub struct UdpSocket {
 
 struct _UdpSocket {
     std: StdUdpSocket,
-    evloop: RemoteHandle,
+    _evloop: RemoteHandle,
 }
 
 impl GenTcpListener for TcpListener {
@@ -190,7 +189,7 @@ impl GenUdpSocket for UdpSocket {
         Ok(UdpSocket {
             inner: Arc::new(_UdpSocket {
                 std: socket,
-                evloop: handle.clone(),
+                _evloop: handle.clone(),
             })
         })
     }

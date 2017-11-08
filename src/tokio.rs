@@ -68,6 +68,10 @@ impl AsRegistrar<Core> for Handle {
 impl RemoteHandle for Remote {
     type EventLoop = Core;
 
+    fn local(&self) -> Option<Handle> {
+        Remote::handle(self)
+    }
+
     fn spawn_locked<F, R>(&self, f: F) where
         F: FnOnce(&<Self::EventLoop as EventLoop>::LocalHandle) -> R + Send + 'static,
         R: IntoFuture<Item = (), Error = ()>,
@@ -284,7 +288,7 @@ impl Future for Accept {
                         self.state = AcceptState::WaitingForLoop(rx, remote_addr);
                         Ok(Async::NotReady)
                     },
-                    Err(err) => {
+                    Err(_) => {
                         // Channel was cancelled, which indicates the loop is dead
                         return Err(io::Error::new(io::ErrorKind::Interrupted, "the loop processing this socket accept has died prematurely"));
                     }

@@ -81,6 +81,15 @@ pub trait LocalHandle: Sized + Clone + 'static {
 pub trait RemoteHandle: Sized + Clone + Send + 'static {
     type EventLoop: EventLoop;
 
+    /// Attempts to obtain a local handle, capable of spawning work onto the `EventLoop` without
+    /// sending it to another thread.
+    /// 
+    /// For `ConcurrentEventLoop`s, it is possible that every thread is capable of having such a
+    /// handle. In that case the implementor should make a best effort to return `None` on threads
+    /// that have not indicated they will be driving the `EventLoop` (e.g. by only returning
+    /// `Some` on threads that have called `turn` or `run`)
+    fn local(&self) -> Option<<Self::EventLoop as EventLoop>::LocalHandle>;
+
     /// Spawns a function that produces a future onto an `EventLoop` thread. The future will
     /// always be polled on the initial thread, so it need not implement `Send`.
     fn spawn_locked<F, R>(&self, f: F) where

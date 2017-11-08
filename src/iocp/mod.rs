@@ -5,18 +5,22 @@ use ::evloop::{Registrar, AsRegistrar};
 
 use std::{io, mem};
 use std::marker::PhantomData;
-use std::cell::UnsafeCell;
+use std::cell::{UnsafeCell, RefCell};
+use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicUsize, AtomicBool, Ordering};
 use std::time::Duration;
 use std::os::windows::prelude::*;
 
+use futures::future;
 use futures::prelude::*;
 use futures::task::AtomicTask;
 use futures::executor::{self, Spawn, Notify, NotifyHandle, UnsafeNotify};
 use miow::Overlapped;
 use miow::iocp::{CompletionPort as RawCompletionPort, CompletionStatus};
+use winhandle::WinHandle;
 use winapi::*;
+use kernel32::*;
 use ws2_32::*;
 
 pub struct CompletionPort {
@@ -37,7 +41,6 @@ pub struct LocalHandle {
 pub struct RemoteHandle {
     inner: Arc<Inner>,
 }
-
 impl CompletionPort {
     pub fn new(max_concurrency: u32) -> io::Result<Self> {
         let inner = Arc::new(Inner {
@@ -71,21 +74,7 @@ impl GenEventLoop for CompletionPort {
     fn run<F>(&mut self, f: F) -> Result<F::Item, F::Error> where
         F: Future,
     {
-        let mut spawn = executor::spawn(f);
-        let notify = Arc::new(SimpleNotify {
-            notified: AtomicBool::new(true),
-        });
-
-        loop {
-            if notify.notified.swap(false, Ordering::SeqCst) { // TODO: relax ordering?
-                match spawn.poll_future_notify(&notify, 0) {
-                    Ok(Async::Ready(t)) => return Ok(t),
-                    Ok(Async::NotReady) => {},
-                    Err(err) => return Err(err),
-                }
-            }
-            self.inner.poll_iocp(None).expect("failed to poll IOCP");
-        }
+        self.inner.run_future(f)
     }
 
     fn turn(&mut self, max_wait: Option<Duration>) {
@@ -97,7 +86,8 @@ impl ConcurrentEventLoop for CompletionPort {
     fn run_concurrent<F>(&self, f: F) -> Result<F::Item, F::Error> where
         F: Future + Send,
     {
-        unimplemented!()
+        // TODO: allow the primary future to be run by any thread in the IOCP maybe?
+        self.inner.run_future(f)
     }
 
     fn turn_concurrent(&self, max_wait: Option<Duration>) {
@@ -108,7 +98,8 @@ impl ConcurrentEventLoop for CompletionPort {
         F: FnOnce(&Self::LocalHandle) -> R,
         R: IntoFuture,
     {
-        unimplemented!()
+        let handle = self.handle();
+        self.inner.run_future(future::lazy(|| f(&handle)))
     }
 }
 
@@ -122,14 +113,14 @@ impl GenLocalHandle for LocalHandle {
     fn spawn<F>(&self, f: F) where
         F: Future<Item = (), Error = ()> + 'static
     {
-        unimplemented!()
+        LocalSpawn::new(&self.remote.inner, Box::new(f));
     }
 
     fn spawn_fn<F, R>(&self, f: F) where
         F: FnOnce() -> R + 'static,
         R: IntoFuture<Item = (), Error = ()> + 'static,
     {
-        unimplemented!()
+        self.spawn(future::lazy(f));
     }
 }
 
@@ -149,19 +140,40 @@ impl RemoteHandle {
 impl GenRemoteHandle for RemoteHandle {
     type EventLoop = CompletionPort;
 
+    fn local(&self) -> Option<LocalHandle> {
+        if self.inner.has_local_work_queue() {
+            Some(LocalHandle {
+                remote: self.clone(),
+                _phantom: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+
     fn spawn_locked<F, R>(&self, f: F) where
         F: FnOnce(&LocalHandle) -> R + Send + 'static,
         R: IntoFuture<Item = (), Error = ()>,
         R::Future: 'static,
     {
-        unimplemented!()
+        let remote = self.clone();
+        self.spawn(future::lazy(move || {
+            let local = LocalHandle {
+                remote,
+                _phantom: PhantomData,
+            };
+
+            local.spawn(f(&local).into_future());
+
+            Ok(())
+        }))
     }
 
     fn spawn<F>(&self, f: F) where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
         let spawn: GlobalSpawn = executor::spawn(Box::new(f));
-        Inner::run_spawn_remote(&self.inner, spawn).expect("failed to queue future on IOCP");
+        Inner::spawn_remote(&self.inner, spawn).expect("failed to queue future on IOCP");
     }
 
     fn spawn_fn<F, R>(&self, f: F) where
@@ -169,7 +181,15 @@ impl GenRemoteHandle for RemoteHandle {
         R: IntoFuture<Item = (), Error = ()>,
         R::Future: Send + 'static,
     {
-        unimplemented!()
+        let remote = self.clone();
+        self.spawn(future::lazy(move || {
+            let local = LocalHandle {
+                remote,
+                _phantom: PhantomData,
+            };
+
+            f(&local).into_future()
+        }))
     }
 }
 
@@ -223,7 +243,7 @@ impl Clone for OverlappedTask {
 
 impl OverlappedTask {
     /// Creates an `OverlappedTask` that will notify the current task.
-    pub fn new(evloop: &RemoteHandle) -> OverlappedTask {
+    pub fn new(_evloop: &RemoteHandle) -> OverlappedTask {
         let overlapped = Box::new(_OverlappedTask {
             overlapped: Overlapped::zero(),
             task: AtomicTask::new(),
@@ -295,7 +315,7 @@ type GlobalSpawn = Spawn<Box<Future<Item = (), Error = ()> + Send>>;
 impl Inner {
     // Drives a spawn by posting it to the IOCP as a custom item. The item may be run by any thread that
     // enters the IOCP.
-    fn run_spawn_remote(this: &Arc<Self>, spawn: GlobalSpawn) -> io::Result<()> {
+    fn spawn_remote(this: &Arc<Self>, spawn: GlobalSpawn) -> io::Result<()> {
         let mut overlapped = Box::new(OverlappedSpawn {
             overlapped: Overlapped::zero(),
             spawn: UnsafeCell::new(mem::ManuallyDrop::new(spawn)),
@@ -313,14 +333,73 @@ impl Inner {
         Ok(())
     }
 
+    fn run_future<F>(&self, f: F) -> Result<F::Item, F::Error> where
+        F: Future,
+    {
+        let mut spawn = executor::spawn(f);
+        let notify = Arc::new(SimpleNotify {
+            notified: AtomicBool::new(true),
+        });
+
+        loop {
+            if notify.notified.swap(false, Ordering::SeqCst) { // TODO: relax ordering?
+                match spawn.poll_future_notify(&notify, 0) {
+                    Ok(Async::Ready(t)) => return Ok(t),
+                    Ok(Async::NotReady) => {},
+                    Err(err) => return Err(err),
+                }
+            }
+            self.poll_iocp(None).expect("failed to poll IOCP");
+        }
+    }
+
     fn poll_iocp(&self, timeout: Option<Duration>) -> io::Result<()> {
+        // Clear local work queue
+        while let Some(spawn) = self.with_local_work_queue(|queue| queue.pop_front()) {
+            spawn.poll();
+        }
+
         // TODO: maybe dequeue multiple events?
-        let mut completion_buffer: [CompletionStatus; 1] = unsafe { mem::zeroed() };
-        let completions = match self.iocp.get_many(&mut completion_buffer, timeout) {
-            Ok(c) => c,
-            Err(ref err) if err.kind() == io::ErrorKind::TimedOut && timeout.is_some() => return Ok(()), // Timeout is okay
-            Err(err) => return Err(err),
-        };
+        let mut completion_buffer: [CompletionStatus; 1];
+        let completions;
+        unsafe {
+            completion_buffer = mem::zeroed();
+            let mut entries_removed: DWORD = 0;
+            let ms_timeout = if let Some(timeout) = timeout {
+                (timeout.as_secs() * 1000) as u32 + timeout.subsec_nanos() / 1_000_000
+            } else {
+                INFINITE
+            };
+            if GetQueuedCompletionStatusEx(
+                self.iocp.as_raw_handle(),
+                completion_buffer.as_mut_ptr() as *mut _,
+                completion_buffer.len() as ULONG,
+                &mut entries_removed,
+                ms_timeout,
+                TRUE, // Perform an alertable wait so we receive notifications to thread-local tasks
+            ) == 0 {
+                let error = GetLastError();
+                match error {
+                    // Timeout is okay
+                    WAIT_TIMEOUT if timeout.is_some() => {
+                        return Ok(());
+                    },
+                    // Local tasks are queued as APCs, which will cause the call to be interrupted with WAIT_IO_COMPLETION
+                    WAIT_IO_COMPLETION => {
+                        // Clear local work queue
+                        while let Some(spawn) = self.with_local_work_queue(|queue| queue.pop_front()) {
+                            spawn.poll();
+                        }
+
+                        return Ok(());
+                    },
+                    error => {
+                        return Err(io::Error::from_raw_os_error(error as i32));
+                    }
+                }
+            }
+            completions = &mut completion_buffer[0..entries_removed as usize];
+        }
 
         for completion in completions.iter() {
             match completion.token() {
@@ -337,16 +416,18 @@ impl Inner {
                                 break;
                             },
                             Ok(Async::NotReady) => {
-                                // The future is waiting for something, re-insert into the IOCP
+                                // The future is waiting for something
                                 // We must make sure that no notifications were received while we were running Poll. If there were,
                                 // we poll again.
                                 // TODO: maybe try to re-poll a certain amount of times, and then put in queue to prevent blocking this
                                 // thread?
+                                // TODO: relax ordering?
                                 match overlapped_spawn.signal_level.compare_exchange(init_signal_level, 0, Ordering::SeqCst, Ordering::SeqCst) {
                                     Ok(_) => break,
                                     Err(level) => {
                                         // Update notify count and retry
                                         init_signal_level = level;
+                                        continue;
                                     },
                                 }
                             },
@@ -362,11 +443,29 @@ impl Inner {
                     let overlapped_task = OverlappedTask(completion.overlapped() as *const _OverlappedTask);
                     overlapped_task.inner().task.notify();
                 },
-                token => panic!("unexpected IOCP token"),
+                _ => panic!("unexpected IOCP token"),
             }
         }
 
         Ok(())
+    }
+
+    fn with_local_work_queue<F, R>(&self, f: F) -> R where
+        F: FnOnce(&mut VecDeque<LocalSpawn>) -> R,
+    {
+        LOCAL_WORK_QUEUE.with(|hashmap| {
+            let mut hashmap = hashmap.borrow_mut();
+            let queue = hashmap
+                .entry(self as *const Inner as usize)
+                .or_insert_with(|| Default::default());
+            f(queue)
+        })
+    }
+
+    fn has_local_work_queue(&self) -> bool {
+        LOCAL_WORK_QUEUE.with(|hashmap| {
+            hashmap.borrow().contains_key(&(self as *const Inner as usize))
+        })
     }
 }
 
@@ -461,7 +560,7 @@ impl OverlappedSpawn {
 }
 
 impl Notify for OverlappedSpawn {
-    fn notify(&self, id: usize) {
+    fn notify(&self, _id: usize) {
         // Signal level is 0 iff we are suspended. In that case it's our job to put the task back on the IOCP.
         if self.signal_level.fetch_add(1, Ordering::SeqCst) == 0 { // TODO: weaken ordering?
             let completion = CompletionStatus::new(0, SPAWN_REMOTE_IOCP_TOKEN, &self.overlapped as *const Overlapped as *mut Overlapped);
@@ -510,9 +609,108 @@ struct SimpleNotify {
 }
 
 impl Notify for SimpleNotify {
-    fn notify(&self, id: usize) {
+    fn notify(&self, _id: usize) {
         self.notified.store(true, Ordering::SeqCst); // TODO: relax ordering?
     }
+}
+
+
+thread_local! {
+    static LOCAL_WORK_QUEUE: RefCell<HashMap<usize, VecDeque<LocalSpawn>>> = Default::default();
+}
+
+// Tasks that are locked to a single thread must be handled differently from those that can migrate.
+// We can't put them on the IOCP, but we can use a less well known future called user APCs. This
+// allows us to queue arbitrary callbacks from any thread that will only be run on the given thread
+// during an "alertable wait". Conveniently enough GetQueuedCompletionStatusEx can perform such a
+// wait, and the APC will cause it to wake up.
+//
+// All notifications will have an Arc<_LocalSpawn>, but there should only ever be one LocalSpawn.
+pub struct LocalSpawn(Arc<_LocalSpawn>);
+
+struct _LocalSpawn {
+    thread: WinHandle,
+    evloop: Arc<Inner>,
+    future: UnsafeCell<Spawn<Box<Future<Item = (), Error = ()>>>>,
+    signal_level: AtomicUsize,
+}
+
+unsafe impl Send for _LocalSpawn {}
+unsafe impl Sync for _LocalSpawn {}
+
+impl LocalSpawn {
+    fn new(evloop: &Arc<Inner>, future: Box<Future<Item = (), Error = ()>>) {
+        let local_spawn = LocalSpawn(Arc::new(_LocalSpawn {
+            thread: unsafe { WinHandle::from_raw_unchecked(GetCurrentThread()) },
+            evloop: evloop.clone(),
+            future: UnsafeCell::new(executor::spawn(future)),
+            signal_level: AtomicUsize::new(1), // signal level is 1 because we will be placing on the queue immediately
+        }));
+        evloop.with_local_work_queue(|queue| queue.push_back(local_spawn));
+    }
+
+    fn poll(self) {
+        let mut init_signal_level = self.0.signal_level.load(Ordering::SeqCst); // TODO: relax ordering?
+        loop {
+            let future = unsafe { &mut *self.0.future.get() };
+            match future.poll_future_notify(&self.0, 0) {
+                Ok(Async::Ready(())) => {
+                    break;
+                },
+                Ok(Async::NotReady) => {
+                    // The future is waiting for something
+                    // We must make sure that no notifications were received while we were running Poll. If there were,
+                    // we poll again.
+                    // TODO: maybe try to re-poll a certain amount of times, and then put in queue to prevent blocking this
+                    // thread?
+                    // TODO: relax ordering?
+                    match self.0.signal_level.compare_exchange(init_signal_level, 0, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break,
+                        Err(level) => {
+                            // Update notify count and retry
+                            init_signal_level = level;
+                            continue;
+                        }
+                    }
+                },
+                Err(()) => {
+                    panic!("raw future in event loop resolved to an error");
+                },
+            }
+        }
+    }
+}
+
+impl Notify for _LocalSpawn {
+    fn notify(&self, _id: usize) {
+        if self.signal_level.fetch_add(1, Ordering::SeqCst) == 0 { // TODO: relax ordering?
+            unsafe {
+                // We need to send an Arc to the APC, but we don't want to drop ourselves. I don't love this :/
+                let self_arc = Arc::from_raw(self as *const _LocalSpawn);
+                let copy_arc = self_arc.clone();
+                mem::forget(self_arc);
+
+                if QueueUserAPC(
+                    Some(notify_local_work),
+                    self.thread.get(),
+                    Arc::into_raw(copy_arc) as _,
+                ) == 0 {
+                    let last_err = GetLastError();
+                    // ERROR_GEN_FAILURE is returned if the thread has terminated
+                    if last_err != ERROR_GEN_FAILURE {
+                        panic!("QueueUserAPC failed: {:?}", io::Error::from_raw_os_error(last_err as i32));
+                    }
+                }
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn notify_local_work(param: ULONG_PTR) {
+    let local_spawn = Arc::from_raw(param as *const _LocalSpawn);
+    local_spawn.evloop.with_local_work_queue(|queue| {
+        queue.push_back(LocalSpawn(local_spawn.clone())) // TODO: get rid of extra clone somehow
+    })
 }
 
 #[cfg(test)]
@@ -521,7 +719,7 @@ mod tests {
 
     use std::thread;
 
-    use futures::future;
+    use futures::{self, future};
 
     #[test]
     fn single_thread_remote_spawn() {
@@ -552,6 +750,40 @@ mod tests {
         thread::spawn(move || {
             iocp.turn_concurrent(None);
         }).join().unwrap();
+        assert_eq!(1, x.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn single_thread_local_spawn() {
+        let iocp = CompletionPort::new(1).unwrap();
+        let x = Arc::new(AtomicUsize::new(0));
+        iocp.handle().spawn(future::lazy({
+            let x = x.clone();
+            move || {
+                x.store(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+        iocp.turn_concurrent(Some(Duration::from_millis(1)));
+        assert_eq!(1, x.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn single_thread_local_notify() {
+        let iocp = CompletionPort::new(1).unwrap();
+        let x = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = futures::sync::oneshot::channel();
+        iocp.handle().spawn(future::lazy({
+            let x = x.clone();
+            move || {
+                rx.map(move |value| {
+                    x.store(value, Ordering::SeqCst);
+                }).map_err(|err| panic!("{:?}", err))
+            }
+        }));
+        iocp.turn_concurrent(Some(Duration::from_millis(1)));
+        tx.send(1).unwrap();
+        iocp.turn_concurrent(None);
         assert_eq!(1, x.load(Ordering::SeqCst));
     }
 }

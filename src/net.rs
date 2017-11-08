@@ -73,9 +73,10 @@ pub trait ConcurrentNetEventLoop: ConcurrentEventLoop + NetEventLoop where
 #[cfg(test)]
 macro_rules! make_net_tests {
     ($make_evloop:expr) => {
+        #[allow(unused)]
         use ::evloop::{EventLoop};
 
-        use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr};
+        use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr};
 
         use futures::future;
         use net2::TcpBuilder;
