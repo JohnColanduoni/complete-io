@@ -1,5 +1,5 @@
 use ::evloop::{EventLoop, LocalHandle, RemoteHandle, Registrar, AsRegistrar};
-use ::net::{NetEventLoop, SendTo, RecvFrom};
+use ::net::{NetEventLoop};
 use ::io::*;
 
 use std::{mem, io};
@@ -10,6 +10,7 @@ use std::net::{SocketAddr, TcpStream as StdTcpStream, TcpListener as StdTcpListe
 
 use futures;
 use futures::prelude::*;
+use bytes::{Bytes, BytesMut};
 use tokio_core::reactor::{Core, Handle, Remote, PollEvented};
 use mio::net::{TcpStream as MioTcpStream, TcpListener as MioTcpListener, UdpSocket as MioUdpSocket};
 
@@ -149,27 +150,21 @@ impl ::net::TcpStream for TcpStream {
 }
 
 impl AsyncRead for TcpStream {
-    type FutureImpl = TcpRead;
+    type Read = TcpRead;
 
-    fn read<B: LockedBufferMut>(self, buffer: B) -> Read<B, TcpRead> {
-        Read {
-            buffer: Some(buffer),
-            future: TcpRead {
-                state: TcpReadState::Pending(self.clone())
-            }
+    fn read(self, buffer: BytesMut) -> TcpRead {
+        TcpRead {
+            state: TcpReadState::Pending(self.clone(), buffer)
         }
     }
 }
 
 impl AsyncWrite for TcpStream {
-    type FutureImpl = TcpWrite;
+    type Write = TcpWrite;
 
-    fn write<B: LockedBuffer>(self, buffer: B) -> Write<B, TcpWrite> {
-        Write {
-            buffer: Some(buffer),
-            future: TcpWrite {
-                state: TcpWriteState::Pending(self.clone())
-            }
+    fn write(self, buffer: Bytes) -> TcpWrite {
+        TcpWrite {
+            state: TcpWriteState::Pending(self.clone(), buffer)
         }
     }
 }
@@ -203,8 +198,8 @@ impl ::net::TcpListener for TcpListener {
 impl ::net::UdpSocket for UdpSocket {
     type EventLoop = Core;
 
-    type SendToFutureImpl = SendToImpl;
-    type RecvFromFutureImpl = RecvFromImpl;
+    type SendTo = SendTo;
+    type RecvFrom = RecvFrom;
 
     fn from_socket<R>(socket: StdUdpSocket, handle: &R) -> Result<Self> where
         R: AsRegistrar<Core>,
@@ -225,21 +220,15 @@ impl ::net::UdpSocket for UdpSocket {
         self.inner.get_ref().connect(addr.clone())
     }
 
-    fn send_to<B: LockedBuffer>(self, buffer: B, addr: &SocketAddr) -> SendTo<B, SendToImpl> {
+    fn send_to(self, buffer: Bytes, addr: &SocketAddr) -> SendTo {
         SendTo {
-            buffer: Some(buffer),
-            future: SendToImpl {
-                state: SendToState::Pending(self, addr.clone()),
-            },
+            state: SendToState::Pending(self, buffer, addr.clone()),
         }
     }
 
-    fn recv_from<B: LockedBufferMut>(self, buffer: B) -> RecvFrom<B, RecvFromImpl> {
+    fn recv_from(self, buffer: BytesMut) -> RecvFrom {
         RecvFrom {
-            buffer: Some(buffer),
-            future: RecvFromImpl {
-                state: RecvFromState::Pending(self),
-            },
+            state: RecvFromState::Pending(self, buffer),
         }
     }
 }
@@ -348,25 +337,23 @@ impl Future for Accept {
 }
 
 #[must_use = "futures do nothing unless polled"]
-#[doc(hidden)]
 pub struct TcpWrite {
     state: TcpWriteState,
 }
 
 enum TcpWriteState {
     None,
-    Pending(TcpStream),
+    Pending(TcpStream, Bytes),
 }
 
-impl IoFutureImpl for TcpWrite {
-}
 
-impl IoWriteFutureImpl for TcpWrite {
-    type Item = (TcpStream, usize);
+impl Future for TcpWrite {
+    type Item = (TcpStream, Bytes, usize);
+    type Error = Error;
 
-    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<(TcpStream, usize), Error> {
-        let bytes = match self.state {
-            TcpWriteState::Pending(ref stream) => {
+    fn poll(&mut self) -> Poll<(TcpStream, Bytes, usize), Error> {
+        let written = match self.state {
+            TcpWriteState::Pending(ref stream, ref buffer) => {
                 if let Async::NotReady = stream.inner.poll_write() {
                     return Ok(Async::NotReady);
                 }
@@ -382,10 +369,10 @@ impl IoWriteFutureImpl for TcpWrite {
             TcpWriteState::None => panic!("future has already completed"),
         };
 
-        match bytes {
-            Ok(bytes) => {
-                if let TcpWriteState::Pending(stream) = mem::replace(&mut self.state, TcpWriteState::None) {
-                    Ok(Async::Ready((stream, bytes)))
+        match written {
+            Ok(written) => {
+                if let TcpWriteState::Pending(stream, buffer) = mem::replace(&mut self.state, TcpWriteState::None) {
+                    Ok(Async::Ready((stream, buffer, written)))
                 } else {
                     unreachable!()
                 }
@@ -399,25 +386,22 @@ impl IoWriteFutureImpl for TcpWrite {
 }
 
 #[must_use = "futures do nothing unless polled"]
-#[doc(hidden)]
 pub struct TcpRead {
     state: TcpReadState,
 }
 
 enum TcpReadState {
     None,
-    Pending(TcpStream),
+    Pending(TcpStream, BytesMut),
 }
 
-impl IoFutureImpl for TcpRead {
-}
+impl Future for TcpRead {
+    type Item = (TcpStream, BytesMut, usize);
+    type Error = Error;
 
-impl IoReadFutureImpl for TcpRead {
-    type Item = (TcpStream, usize);
-
-    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(TcpStream, usize), Error> {
-        let bytes = match self.state {
-            TcpReadState::Pending(ref stream) => {
+    fn poll(&mut self) -> Poll<(TcpStream, BytesMut, usize), Error> {
+        let read = match self.state {
+            TcpReadState::Pending(ref stream, ref mut buffer) => {
                 if let Async::NotReady = stream.inner.poll_read() {
                     return Ok(Async::NotReady);
                 }
@@ -433,10 +417,10 @@ impl IoReadFutureImpl for TcpRead {
             TcpReadState::None => panic!("future has already completed"),
         };
 
-        match bytes {
-            Ok(bytes) => {
-                if let TcpReadState::Pending(stream) = mem::replace(&mut self.state, TcpReadState::None) {
-                    Ok(Async::Ready((stream, bytes)))
+        match read {
+            Ok(read) => {
+                if let TcpReadState::Pending(stream, buffer) = mem::replace(&mut self.state, TcpReadState::None) {
+                    Ok(Async::Ready((stream, buffer, read)))
                 } else {
                     unreachable!()
                 }
@@ -449,30 +433,28 @@ impl IoReadFutureImpl for TcpRead {
     }
 }
 
-#[doc(hidden)]
-pub struct RecvFromImpl {
+#[must_use = "futures do nothing unless polled"]
+pub struct RecvFrom {
     state: RecvFromState,
 }
 
 enum RecvFromState {
     None,
-    Pending(UdpSocket),
+    Pending(UdpSocket, BytesMut),
 }
 
-impl IoFutureImpl for RecvFromImpl {
-}
-
-impl IoReadFutureImpl for RecvFromImpl {
-    type Item = (UdpSocket, usize, SocketAddr);
+impl Future for RecvFrom {
+    type Item = (UdpSocket, BytesMut, usize, SocketAddr);
+    type Error = Error;
     
-    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(UdpSocket, usize, SocketAddr), Error> {
+    fn poll(&mut self) -> Poll<(UdpSocket, BytesMut, usize, SocketAddr), Error> {
         let result = match self.state {
-            RecvFromState::Pending(ref socket) => {
+            RecvFromState::Pending(ref socket, ref mut buffer) => {
                 if let Async::NotReady = socket.inner.poll_read() {
                     return Ok(Async::NotReady);
                 }
-                match socket.inner.get_ref().recv_from(buffer.as_mut()) {
-                    Ok((bytes, remote_addr)) => Ok((bytes, remote_addr)),
+                match socket.inner.get_ref().recv_from(buffer) {
+                    Ok((read, remote_addr)) => Ok((read, remote_addr)),
                     Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
                         socket.inner.need_read();
                         return Ok(Async::NotReady);
@@ -484,9 +466,9 @@ impl IoReadFutureImpl for RecvFromImpl {
         };
 
         match result {
-            Ok((bytes, addr)) => {
-                if let RecvFromState::Pending(socket) = mem::replace(&mut self.state, RecvFromState::None) {
-                    Ok(Async::Ready((socket, bytes, addr)))
+            Ok((read, addr)) => {
+                if let RecvFromState::Pending(socket, buffer) = mem::replace(&mut self.state, RecvFromState::None) {
+                    Ok(Async::Ready((socket, buffer, read, addr)))
                 } else {
                     unreachable!()
                 }
@@ -499,30 +481,28 @@ impl IoReadFutureImpl for RecvFromImpl {
     }
 }
 
-#[doc(hidden)]
-pub struct SendToImpl {
+#[must_use = "futures do nothing unless polled"]
+pub struct SendTo {
     state: SendToState,
 }
 
 enum SendToState {
     None,
-    Pending(UdpSocket, SocketAddr),
+    Pending(UdpSocket, Bytes, SocketAddr),
 }
 
-impl IoFutureImpl for SendToImpl {
-}
-
-impl IoWriteFutureImpl for SendToImpl {
-    type Item = UdpSocket;
+impl Future for SendTo {
+    type Item = (UdpSocket, Bytes);
+    type Error = Error;
     
-    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<UdpSocket, Error> {
+    fn poll(&mut self) -> Poll<(UdpSocket, Bytes), Error> {
         let result = match self.state {
-            SendToState::Pending(ref socket, ref addr) => {
+            SendToState::Pending(ref socket, ref buffer, ref addr) => {
                 if let Async::NotReady = socket.inner.poll_write() {
                     return Ok(Async::NotReady);
                 }
-                match socket.inner.get_ref().send_to(buffer.as_ref(), addr) {
-                    Ok(bytes) => if bytes == buffer.as_ref().len() {
+                match socket.inner.get_ref().send_to(&buffer, addr) {
+                    Ok(bytes) => if bytes == buffer.len() {
                         Ok(())
                     } else {
                         Err(io::ErrorKind::WriteZero.into())
@@ -539,8 +519,8 @@ impl IoWriteFutureImpl for SendToImpl {
 
         match result {
             Ok(()) => {
-                if let SendToState::Pending(socket, _) = mem::replace(&mut self.state, SendToState::None) {
-                    Ok(Async::Ready(socket))
+                if let SendToState::Pending(socket, buffer, _) = mem::replace(&mut self.state, SendToState::None) {
+                    Ok(Async::Ready((socket, buffer)))
                 } else {
                     unreachable!()
                 }

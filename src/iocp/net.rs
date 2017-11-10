@@ -1,6 +1,6 @@
 use ::evloop::{AsRegistrar};
 use ::iocp::{CompletionPort, RemoteHandle, OverlappedTask};
-use ::net::{NetEventLoop, SendTo, RecvFrom};
+use ::net::{NetEventLoop};
 use ::io::*;
 
 use std::{mem, io};
@@ -10,6 +10,7 @@ use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr, TcpListener as StdTcpList
 use std::os::windows::prelude::*;
 
 use futures::prelude::*;
+use bytes::{Bytes, BytesMut};
 use winapi::*;
 use ws2_32::*;
 use net2::TcpBuilder;
@@ -179,32 +180,32 @@ impl ::net::TcpStream for TcpStream {
 }
 
 impl AsyncRead for TcpStream {
-    type FutureImpl = TcpRead;
+    type Read = TcpRead;
 
-    fn read<B: LockedBufferMut>(self, buffer: B) -> Read<B, TcpRead> {
-        Read {
-            buffer: Some(buffer),
-            future: TcpRead { state: TcpReadState::Initial(self.clone()) }
-        }
+    fn read(self, mut buffer: BytesMut) -> TcpRead {
+        ensure_bytesmut_safe(&mut buffer);
+        TcpRead { state: TcpReadState::Initial(self.clone(), buffer) }
     }
 }
 
 impl AsyncWrite for TcpStream {
-    type FutureImpl = TcpWrite;
+    type Write = TcpWrite;
 
-    fn write<B: LockedBuffer>(self, buffer: B) -> Write<B, TcpWrite> {
-        Write {
-            buffer: Some(buffer),
-            future: TcpWrite { state: TcpWriteState::Initial(self.clone()) }
-        }
+    fn write(self, mut buffer: Bytes) -> TcpWrite {
+        ensure_bytes_safe(&mut buffer);
+        TcpWrite { state: TcpWriteState::Initial(self.clone(), buffer) }
     }
+}
+
+impl AsRawSocket for TcpStream {
+    fn as_raw_socket(&self) -> SOCKET { self.inner.std.as_raw_socket() }
 }
 
 impl ::net::UdpSocket for UdpSocket {
     type EventLoop = CompletionPort;
 
-    type RecvFromFutureImpl = RecvFromImpl;
-    type SendToFutureImpl = SendToImpl;
+    type RecvFrom = RecvFrom;
+    type SendTo = SendTo;
 
     fn from_socket<R>(socket: StdUdpSocket, handle: &R) -> Result<Self> where
         R: AsRegistrar<Self::EventLoop>,
@@ -228,23 +229,23 @@ impl ::net::UdpSocket for UdpSocket {
         self.inner.std.connect(addr)
     }
 
-    fn send_to<B: LockedBuffer>(self, buffer: B, addr: &SocketAddr) -> SendTo<B, SendToImpl> {
+    fn send_to(self, mut buffer: Bytes, addr: &SocketAddr) -> SendTo {
+        ensure_bytes_safe(&mut buffer);
         SendTo {
-            buffer: Some(buffer),
-            future: SendToImpl {
-                state: SendToState::Initial(self, addr.clone()),
-            },
+            state: SendToState::Initial(self, buffer, addr.clone()),
         }
     }
 
-    fn recv_from<B: LockedBufferMut>(self, buffer: B) -> RecvFrom<B, RecvFromImpl> {
+    fn recv_from(self, mut buffer: BytesMut) -> RecvFrom {
+        ensure_bytesmut_safe(&mut buffer);
         RecvFrom {
-            buffer: Some(buffer),
-            future: RecvFromImpl {
-                state: RecvFromState::Initial(self),
-            },
+            state: RecvFromState::Initial(self, buffer),
         }
     }
+}
+
+impl AsRawSocket for UdpSocket {
+    fn as_raw_socket(&self) -> SOCKET { self.inner.std.as_raw_socket() }
 }
 
 impl NetEventLoop for CompletionPort {
@@ -393,44 +394,52 @@ impl Future for Connect {
 }
 
 #[must_use = "futures do nothing unless polled"]
-#[doc(hidden)]
 pub struct TcpWrite {
     state: TcpWriteState,
 }
 
 enum TcpWriteState {
     None,
-    Initial(TcpStream),
-    Pending(TcpStream, OverlappedTask),
+    Initial(TcpStream, Bytes),
+    Pending(TcpStream, Bytes, OverlappedTask),
 }
 
-impl IoFutureImpl for TcpWrite {
-    fn cancel(&mut self) -> Result<()> {
-        unimplemented!()
+impl Drop for TcpWrite {
+    fn drop(&mut self) {
+        match mem::replace(&mut self.state, TcpWriteState::None) {
+            TcpWriteState::Pending(socket, buf, overlapped) => {
+                if let Err((_, err)) = overlapped.cancel_socket(&socket) {
+                    error!("cancelation of overlapped operation failed, leaking buffers for safety: {:?}", err);
+                    mem::forget(buf);
+                }
+            },
+            _ => {},
+        }
     }
 }
 
-impl IoWriteFutureImpl for TcpWrite {
-    type Item = (TcpStream, usize);
+impl Future for TcpWrite {
+    type Item = (TcpStream, Bytes, usize);
+    type Error = Error;
 
-    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<(TcpStream, usize), Error> {
+    fn poll(&mut self) -> Poll<(TcpStream, Bytes, usize), Error> {
         match mem::replace(&mut self.state, TcpWriteState::None) {
-            TcpWriteState::Initial(stream) => {
+            TcpWriteState::Initial(stream, buffer) => {
                 let task = OverlappedTask::new(&stream.inner.evloop);
                 match unsafe { task.clone().for_operation(|overlapped| stream.inner.std.write_overlapped(buffer.as_ref(), overlapped)) }? {
-                    Some(bytes) => Ok(Async::Ready((stream, bytes))),
+                    Some(bytes) => Ok(Async::Ready((stream, buffer, bytes))),
                     None => {
-                        self.state = TcpWriteState::Pending(stream, task);
+                        self.state = TcpWriteState::Pending(stream, buffer, task);
                         Ok(Async::NotReady)
                     },
                 }
             },
-            TcpWriteState::Pending(stream, task) => {
+            TcpWriteState::Pending(stream, buffer, task) => {
                 task.register();
                 match task.poll_socket(&stream.inner.std)? {
-                    Async::Ready((bytes, _)) => Ok(Async::Ready((stream, bytes))),
+                    Async::Ready((bytes, _)) => Ok(Async::Ready((stream, buffer, bytes))),
                     Async::NotReady => {
-                        self.state = TcpWriteState::Pending(stream, task);
+                        self.state = TcpWriteState::Pending(stream, buffer, task);
                         Ok(Async::NotReady)
                     },
                 }
@@ -441,44 +450,52 @@ impl IoWriteFutureImpl for TcpWrite {
 }
 
 #[must_use = "futures do nothing unless polled"]
-#[doc(hidden)]
 pub struct TcpRead {
     state: TcpReadState,
 }
 
 enum TcpReadState {
     None,
-    Initial(TcpStream),
-    Pending(TcpStream, OverlappedTask),
+    Initial(TcpStream, BytesMut),
+    Pending(TcpStream, BytesMut, OverlappedTask),
 }
 
-impl IoFutureImpl for TcpRead {
-    fn cancel(&mut self) -> Result<()> {
-        unimplemented!()
+impl Drop for TcpRead {
+    fn drop(&mut self) {
+        match mem::replace(&mut self.state, TcpReadState::None) {
+            TcpReadState::Pending(socket, buf, overlapped) => {
+                if let Err((_, err)) = overlapped.cancel_socket(&socket) {
+                    error!("cancelation of overlapped operation failed, leaking buffers for safety: {:?}", err);
+                    mem::forget(buf);
+                }
+            },
+            _ => {},
+        }
     }
 }
 
-impl IoReadFutureImpl for TcpRead {
-    type Item = (TcpStream, usize);
+impl Future for TcpRead {
+    type Item = (TcpStream, BytesMut, usize);
+    type Error = Error;
     
-    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(TcpStream, usize), Error> {
+    fn poll(&mut self) -> Poll<(TcpStream, BytesMut, usize), Error> {
         match mem::replace(&mut self.state, TcpReadState::None) {
-            TcpReadState::Initial(stream) => {
+            TcpReadState::Initial(stream, mut buffer) => {
                 let task = OverlappedTask::new(&stream.inner.evloop);
-                match unsafe { task.clone().for_operation(|overlapped| stream.inner.std.read_overlapped(buffer.as_mut(), overlapped)) }? {
-                    Some(bytes) => Ok(Async::Ready((stream, bytes))),
+                match unsafe { task.clone().for_operation(|overlapped| stream.inner.std.read_overlapped(&mut buffer, overlapped)) }? {
+                    Some(bytes) => Ok(Async::Ready((stream, buffer, bytes))),
                     None => {
-                        self.state = TcpReadState::Pending(stream, task);
+                        self.state = TcpReadState::Pending(stream, buffer, task);
                         Ok(Async::NotReady)
                     },
                 }
             },
-            TcpReadState::Pending(stream, task) => {
+            TcpReadState::Pending(stream, buffer, task) => {
                 task.register();
                 match task.poll_socket(&stream.inner.std)? {
-                    Async::Ready((bytes, _)) => Ok(Async::Ready((stream, bytes))),
+                    Async::Ready((bytes, _)) => Ok(Async::Ready((stream, buffer, bytes))),
                     Async::NotReady => {
-                        self.state = TcpReadState::Pending(stream, task);
+                        self.state = TcpReadState::Pending(stream, buffer, task);
                         Ok(Async::NotReady)
                     },
                 }
@@ -489,45 +506,55 @@ impl IoReadFutureImpl for TcpRead {
 }
 
 
-#[doc(hidden)]
-pub struct RecvFromImpl {
+#[must_use = "futures do nothing unless polled"]
+pub struct RecvFrom {
     state: RecvFromState,
 }
 
 enum RecvFromState {
     None,
-    Initial(UdpSocket),
-    Pending(UdpSocket, Box<SocketAddrBuf>, OverlappedTask),
+    Initial(UdpSocket, BytesMut),
+    Pending(UdpSocket, BytesMut, Box<SocketAddrBuf>, OverlappedTask),
 }
 
-impl IoFutureImpl for RecvFromImpl {
-    fn cancel(&mut self) -> Result<()> {
-        unimplemented!()
+impl Drop for RecvFrom {
+    fn drop(&mut self) {
+        match mem::replace(&mut self.state, RecvFromState::None) {
+            RecvFromState::Pending(socket, buf, addr_buf, overlapped) => {
+                if let Err((_, err)) = overlapped.cancel_socket(&socket) {
+                    error!("cancelation of overlapped operation failed, leaking buffers for safety: {:?}", err);
+                    mem::forget(buf);
+                    mem::forget(addr_buf);
+                }
+            },
+            _ => {},
+        }
     }
 }
 
-impl IoReadFutureImpl for RecvFromImpl {
-    type Item = (UdpSocket, usize, SocketAddr);
+impl Future for RecvFrom {
+    type Item = (UdpSocket, BytesMut, usize, SocketAddr);
+    type Error = Error;
     
-    fn poll<B: LockedBufferMut>(&mut self, buffer: &mut B) -> Poll<(UdpSocket, usize, SocketAddr), Error> {
+    fn poll(&mut self) -> Poll<(UdpSocket, BytesMut, usize, SocketAddr), Error> {
         match mem::replace(&mut self.state, RecvFromState::None) {
-            RecvFromState::Initial(socket) => {
-                let task = OverlappedTask::new(&socket.inner.evloop);
-                let mut addr_buf = Box::new(SocketAddrBuf::new());
-                match unsafe { task.clone().for_operation(|overlapped| socket.inner.std.recv_from_overlapped(buffer.as_mut(), &mut *addr_buf, overlapped)) }? {
-                    Some(bytes) => Ok(Async::Ready((socket, bytes, addr_buf.to_socket_addr().unwrap()))),
+            RecvFromState::Initial(socket, mut buffer) => {
+                let task = OverlappedTask::new(&socket.inner.evloop); // TODO: pool tasks
+                let mut addr_buf = Box::new(SocketAddrBuf::new()); // TODO: pool buffers
+                match unsafe { task.clone().for_operation(|overlapped| socket.inner.std.recv_from_overlapped(&mut buffer, &mut *addr_buf, overlapped)) }? {
+                    Some(read) => Ok(Async::Ready((socket, buffer, read, addr_buf.to_socket_addr().unwrap()))),
                     None => {
-                        self.state = RecvFromState::Pending(socket, addr_buf, task);
+                        self.state = RecvFromState::Pending(socket, buffer, addr_buf, task);
                         Ok(Async::NotReady)
                     },
                 }
             },
-            RecvFromState::Pending(socket, addr_buf, task) => {
+            RecvFromState::Pending(socket, buffer, addr_buf, task) => {
                 task.register();
                 match task.poll_socket(&socket.inner.std)? {
-                    Async::Ready((bytes, _)) => Ok(Async::Ready((socket, bytes, addr_buf.to_socket_addr().unwrap()))),
+                    Async::Ready((read, _)) => Ok(Async::Ready((socket, buffer, read, addr_buf.to_socket_addr().unwrap()))),
                     Async::NotReady => {
-                        self.state = RecvFromState::Pending(socket, addr_buf, task);
+                        self.state = RecvFromState::Pending(socket, buffer, addr_buf, task);
                         Ok(Async::NotReady)
                     },
                 }
@@ -537,62 +564,90 @@ impl IoReadFutureImpl for RecvFromImpl {
     }
 }
 
-#[doc(hidden)]
-pub struct SendToImpl {
+#[must_use = "futures do nothing unless polled"]
+pub struct SendTo {
     state: SendToState,
 }
 
 enum SendToState {
     None,
-    Initial(UdpSocket, SocketAddr),
-    Pending(UdpSocket, OverlappedTask),
+    Initial(UdpSocket, Bytes, SocketAddr),
+    Pending(UdpSocket, Bytes, OverlappedTask),
 }
 
-impl IoFutureImpl for SendToImpl {
-    fn cancel(&mut self) -> Result<()> {
-        unimplemented!()
+impl Drop for SendTo {
+    fn drop(&mut self) {
+        match mem::replace(&mut self.state, SendToState::None) {
+            SendToState::Pending(socket, buf, overlapped) => {
+                if let Err((_, err)) = overlapped.cancel_socket(&socket) {
+                    error!("cancelation of overlapped operation failed, leaking buffers for safety: {:?}", err);
+                    mem::forget(buf);
+                }
+            },
+            _ => {},
+        }
     }
 }
 
-impl IoWriteFutureImpl for SendToImpl {
-    type Item = UdpSocket;
+impl Future for SendTo {
+    type Item = (UdpSocket, Bytes);
+    type Error = Error;
     
-    fn poll<B: LockedBuffer>(&mut self, buffer: &B) -> Poll<UdpSocket, Error> {
+    fn poll(&mut self) -> Poll<(UdpSocket, Bytes), Error> {
         match mem::replace(&mut self.state, SendToState::None) {
-            SendToState::Initial(socket, addr) => {
-                let task = OverlappedTask::new(&socket.inner.evloop);
+            SendToState::Initial(socket, buffer, addr) => {
+                let task = OverlappedTask::new(&socket.inner.evloop); // TODO: pool tasks
                 match unsafe { task.clone().for_operation(|overlapped| socket.inner.std.send_to_overlapped(buffer.as_ref(), &addr, overlapped)) }? {
                     Some(bytes) => {
                         if bytes == buffer.as_ref().len() {
-                            Ok(Async::Ready(socket))
+                            Ok(Async::Ready((socket, buffer)))
                         } else {
                             Err(io::ErrorKind::WriteZero.into())
                         }
                     },
                     None => {
-                        self.state = SendToState::Pending(socket, task);
+                        self.state = SendToState::Pending(socket, buffer, task);
                         Ok(Async::NotReady)
                     },
                 }
             },
-            SendToState::Pending(socket, task) => {
+            SendToState::Pending(socket, buffer, task) => {
                 task.register();
                 match task.poll_socket(&socket.inner.std)? {
                     Async::Ready((bytes, _)) => {
                         if bytes == buffer.as_ref().len() {
-                            Ok(Async::Ready(socket))
+                            Ok(Async::Ready((socket, buffer)))
                         } else {
                             Err(io::ErrorKind::WriteZero.into())
                         }
                     },
                     Async::NotReady => {
-                        self.state = SendToState::Pending(socket, task);
+                        self.state = SendToState::Pending(socket, buffer, task);
                         Ok(Async::NotReady)
                     },
                 }
             },
             SendToState::None => panic!("future has already completed"),
         }
+    }
+}
+
+// Bytes can store data inline. Ensure this is not the case here
+fn ensure_bytes_safe(bytes: &mut Bytes) {
+    let data_ptr = bytes.as_ptr() as usize;
+    let struct_ptr = bytes as *const Bytes;
+    let struct_end = unsafe { struct_ptr.offset(1) };
+    if data_ptr >= struct_ptr as usize && data_ptr < struct_end as usize {
+        *bytes = Bytes::from(bytes.to_vec());
+    }
+}
+// BytesMut can store data inline. Ensure this is not the case here
+fn ensure_bytesmut_safe(bytes: &mut BytesMut) {
+    let data_ptr = bytes.as_ptr() as usize;
+    let struct_ptr = bytes as *const BytesMut;
+    let struct_end = unsafe { struct_ptr.offset(1) };
+    if data_ptr >= struct_ptr as usize && data_ptr < struct_end as usize {
+        *bytes = BytesMut::from(bytes.to_vec());
     }
 }
 

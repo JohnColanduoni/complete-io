@@ -1,5 +1,6 @@
 #[macro_use] extern crate futures;
 #[macro_use] extern crate log;
+extern crate bytes;
 
 #[cfg(feature = "tokio")]
 extern crate tokio_core;
@@ -9,7 +10,7 @@ extern crate mio;
 #[cfg(all(feature = "iocp", target_os = "windows"))]
 extern crate miow;
 #[cfg(all(feature = "iocp", target_os = "windows"))]
-extern crate winhandle;
+#[macro_use] extern crate winhandle;
 #[cfg(all(feature = "iocp", target_os = "windows"))]
 extern crate winapi;
 #[cfg(all(feature = "iocp", target_os = "windows"))]

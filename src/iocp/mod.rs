@@ -304,6 +304,13 @@ impl OverlappedTask {
         }
     }
 
+    pub fn cancel_socket<S: AsRawSocket>(self, socket: &S) -> Result<(), (Self, io::Error)> {
+        unsafe { winapi_bool_call!(CancelIoEx(
+            socket.as_raw_socket() as _,
+            self.inner().overlapped.raw(),
+        )).map_err(|err| (self, err)) }
+    }
+
     #[inline]
     fn inner(&self) -> &_OverlappedTask {
         unsafe { &*(self.0) }
@@ -721,6 +728,7 @@ unsafe extern "system" fn notify_local_work(param: ULONG_PTR) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::evloop::{RemoteHandle as GenRemoteHandle};
 
     use std::thread;
 

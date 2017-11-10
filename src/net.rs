@@ -1,11 +1,11 @@
 use ::evloop::{EventLoop, ConcurrentEventLoop, AsRegistrar};
 use ::io::*;
 
-use std::{mem};
 use std::io::{Error, Result};
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
 
 use futures::prelude::*;
+use bytes::{Bytes, BytesMut};
 
 pub trait TcpListener: Sized + Clone {
     type EventLoop: EventLoop;
@@ -44,10 +44,8 @@ pub trait TcpStream: Sized + AsyncRead + AsyncWrite + Clone {
 pub trait UdpSocket: Sized + Clone {
     type EventLoop: EventLoop;
 
-    #[doc(hidden)]
-    type SendToFutureImpl: IoWriteFutureImpl<Item = Self>;
-    #[doc(hidden)]
-    type RecvFromFutureImpl: IoReadFutureImpl<Item = (Self, usize, SocketAddr)>;
+    type SendTo: Future<Item = (Self, Bytes), Error = Error> + Send + 'static;
+    type RecvFrom: Future<Item = (Self, BytesMut, usize, SocketAddr), Error = Error> + Send + 'static;
     
     fn bind<R>(addr: &SocketAddr, handle: &R) -> Result<Self> where
         R: AsRegistrar<Self::EventLoop>,
@@ -62,9 +60,9 @@ pub trait UdpSocket: Sized + Clone {
 
     fn connect(&self, addr: &SocketAddr) -> Result<()>;
 
-    fn send_to<B: LockedBuffer>(self, buffer: B, addr: &SocketAddr) -> SendTo<B, Self::SendToFutureImpl>;
+    fn send_to(self, buffer: Bytes, addr: &SocketAddr) -> Self::SendTo;
 
-    fn recv_from<B: LockedBufferMut>(self, buffer: B) -> RecvFrom<B, Self::RecvFromFutureImpl>;
+    fn recv_from(self, buffer: BytesMut) -> Self::RecvFrom;
 }
 
 pub trait NetEventLoop: EventLoop {
@@ -80,82 +78,6 @@ pub trait ConcurrentNetEventLoop: ConcurrentEventLoop + NetEventLoop where
     Self::Registrar: Send,
     Self::RemoteHandle: AsRegistrar<Self>,
 { }
-
-#[must_use = "futures do nothing unless polled"]
-pub struct RecvFrom<B, F: IoReadFutureImpl> {
-    #[doc(hidden)]
-    pub buffer: Option<B>,
-    #[doc(hidden)]
-    pub future: F,
-}
-
-#[must_use = "futures do nothing unless polled"]
-pub struct SendTo<B, F: IoWriteFutureImpl> {
-    #[doc(hidden)]
-    pub buffer: Option<B>,
-    #[doc(hidden)]
-    pub future: F,
-}
-
-impl<B, F: IoReadFutureImpl> Drop for RecvFrom<B, F> {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            if let Err(err) = self.future.cancel() {
-                warn!("leaking buffer because cancellation of IO operation failed: {:?}", err);
-                mem::forget(buffer);
-            }
-        }
-    }
-}
-
-impl<B, F: IoWriteFutureImpl> Drop for SendTo<B, F> {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            if let Err(err) = self.future.cancel() {
-                warn!("leaking buffer because cancellation of IO operation failed: {:?}", err);
-                mem::forget(buffer);
-            }
-        }
-    }
-}
-
-impl<B, F, T1: Sized> Future for RecvFrom<B, F> where
-    B: LockedBufferMut,
-    F: IoReadFutureImpl<Item = (T1, usize, SocketAddr)>,
-{
-    type Item = (T1, B, usize, SocketAddr);
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<(T1, B, usize, SocketAddr), Error> {
-        let (t1, t2, t3) = match self.buffer {
-            Some(ref mut buffer) => {
-                try_ready!(self.future.poll(buffer))
-            },
-            None => panic!("future already completed"),
-        };
-
-        Ok(Async::Ready((t1, self.buffer.take().unwrap(), t2, t3)))
-    }
-}
-
-impl<B, F, T1: Sized> Future for SendTo<B, F> where
-    B: LockedBuffer,
-    F: IoWriteFutureImpl<Item = T1>,
-{
-    type Item = (T1, B);
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<(T1, B), Error> {
-        let t1 = match self.buffer {
-            Some(ref buffer) => {
-                try_ready!(self.future.poll(buffer))
-            },
-            None => panic!("future already completed"),
-        };
-
-        Ok(Async::Ready((t1, self.buffer.take().unwrap())))
-    }
-}
 
 #[cfg(test)]
 macro_rules! make_net_tests {
@@ -236,12 +158,12 @@ macro_rules! make_net_tests {
                     let message = "hello";
                     let client_fut = 
                         client
-                            .write(message.to_string().into_bytes())
-                            .and_then(|(client, buffer, _bytes)| client.read(buffer));
+                            .write(Bytes::from(message.to_string().into_bytes()))
+                            .and_then(|(client, buffer, _bytes)| client.read(buffer.try_mut().unwrap()));
                     let server_fut =
                         server
-                            .read(vec![0u8; message.len()])
-                            .and_then(|(server, buffer, _bytes)| server.write(buffer));
+                            .read(BytesMut::from(vec![0u8; message.len()]))
+                            .and_then(|(server, buffer, _bytes)| server.write(buffer.freeze()));
 
                     client_fut.join(server_fut)
                 })
@@ -260,12 +182,12 @@ macro_rules! make_net_tests {
                 let message = "hello";
                 let client_fut = 
                     client
-                        .send_to(message.to_string().into_bytes(), &server_addr)
-                        .and_then(|(client, buffer)| client.recv_from(buffer));
+                        .send_to(Bytes::from(message.to_string().into_bytes()), &server_addr)
+                        .and_then(|(client, buffer)| client.recv_from(buffer.try_mut().unwrap()));
                 let server_fut =
                     server
-                        .recv_from(vec![0u8; message.len()])
-                        .and_then(|(server, buffer, _bytes, remote_addr)| server.send_to(buffer, &remote_addr));
+                        .recv_from(BytesMut::from(vec![0u8; message.len()]))
+                        .and_then(|(server, buffer, _bytes, remote_addr)| server.send_to(buffer.freeze(), &remote_addr));
 
                 client_fut.join(server_fut)
             })).unwrap();
