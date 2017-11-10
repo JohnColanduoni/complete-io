@@ -83,13 +83,15 @@ pub trait ConcurrentNetEventLoop: ConcurrentEventLoop + NetEventLoop where
 macro_rules! make_net_tests {
     ($make_evloop:expr) => {
         #[allow(unused)]
-        use ::evloop::{EventLoop};
+        use ::evloop::{EventLoop, RemoteHandle};
         use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket};
 
         use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr};
 
         use futures::future;
         use net2::TcpBuilder;
+
+        const MESSAGE: &str = "hello";
 
         #[test]
         fn accept_connect() {
@@ -147,25 +149,26 @@ macro_rules! make_net_tests {
         #[test]
         fn tcp_echo() {
             let mut evloop = $make_evloop;
+            let remote = evloop.remote();
             let handle = evloop.handle();
             let listener = TcpListener::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
             let mut listener_addr = listener.local_addr().unwrap();
             listener_addr.set_ip("127.0.0.1".parse().unwrap());
-            evloop.run(future::lazy(|| {
-                let accepted = listener.accept();
-                let connected = TcpStream::connect(&listener_addr, &handle);
-                accepted.join(connected).and_then(|((server, _), client)| {
-                    let message = "hello";
-                    let client_fut = 
-                        client
-                            .write(Bytes::from(message.to_string().into_bytes()))
-                            .and_then(|(client, buffer, _bytes)| client.read(buffer.try_mut().unwrap()));
-                    let server_fut =
-                        server
-                            .read(BytesMut::from(vec![0u8; message.len()]))
-                            .and_then(|(server, buffer, _bytes)| server.write(buffer.freeze()));
 
-                    client_fut.join(server_fut)
+            remote.spawn_fn(move |_| {
+                listener.accept().and_then(|(server, _)| {
+                    server
+                        .read(BytesMut::from(vec![0u8; MESSAGE.len()]))
+                        .and_then(|(server, buffer, _bytes)| server.write(buffer.freeze()))
+                }).map(|_| ()).map_err(|err| panic!("{:?}", err))
+            });
+
+            evloop.run(future::lazy(|| {
+                let connected = TcpStream::connect(&listener_addr, &handle);
+                connected.and_then(|client| {
+                    client
+                        .write(Bytes::from(MESSAGE.to_string().into_bytes()))
+                        .and_then(|(client, buffer, _bytes)| client.read(buffer.try_mut().unwrap()))
                 })
             })).unwrap();
         }
@@ -178,18 +181,18 @@ macro_rules! make_net_tests {
             let mut server_addr = server.local_addr().unwrap();
             server_addr.set_ip("127.0.0.1".parse().unwrap());
             let client = UdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
-            evloop.run(future::lazy(|| {
-                let message = "hello";
-                let client_fut = 
-                    client
-                        .send_to(Bytes::from(message.to_string().into_bytes()), &server_addr)
-                        .and_then(|(client, buffer)| client.recv_from(buffer.try_mut().unwrap()));
-                let server_fut =
-                    server
-                        .recv_from(BytesMut::from(vec![0u8; message.len()]))
-                        .and_then(|(server, buffer, _bytes, remote_addr)| server.send_to(buffer.freeze(), &remote_addr));
 
-                client_fut.join(server_fut)
+            evloop.remote().spawn_fn(move |_| {
+                server
+                    .recv_from(BytesMut::from(vec![0u8; MESSAGE.len()]))
+                    .and_then(|(server, buffer, _bytes, remote_addr)| server.send_to(buffer.freeze(), &remote_addr))
+                    .map(|_| ()).map_err(|err| panic!("{:?}", err))
+            });
+            evloop.turn(None);
+            evloop.run(future::lazy(|| {
+                client
+                    .send_to(Bytes::from(MESSAGE.to_string().into_bytes()), &server_addr)
+                    .and_then(|(client, buffer)| client.recv_from(buffer.try_mut().unwrap()))
             })).unwrap();
         }
 

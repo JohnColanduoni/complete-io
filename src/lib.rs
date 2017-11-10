@@ -8,6 +8,8 @@ extern crate tokio_core;
 extern crate mio;
 
 #[cfg(all(feature = "iocp", target_os = "windows"))]
+#[macro_use] extern crate scoped_tls;
+#[cfg(all(feature = "iocp", target_os = "windows"))]
 extern crate miow;
 #[cfg(all(feature = "iocp", target_os = "windows"))]
 #[macro_use] extern crate winhandle;

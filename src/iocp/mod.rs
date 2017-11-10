@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::cell::{UnsafeCell, RefCell};
 use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{self, AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{self, AtomicUsize, AtomicBool,Ordering};
 use std::time::Duration;
 use std::os::windows::prelude::*;
 
@@ -175,8 +175,7 @@ impl ::evloop::RemoteHandle for RemoteHandle {
     fn spawn<F>(&self, f: F) where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
-        let spawn: GlobalSpawn = executor::spawn(Box::new(f));
-        Inner::spawn_remote(&self.inner, spawn).expect("failed to queue future on IOCP");
+        Inner::spawn_remote(&self.inner, Box::new(f)).expect("failed to queue future on IOCP");
     }
 
     fn spawn_fn<F, R>(&self, f: F) where
@@ -320,15 +319,13 @@ impl OverlappedTask {
 const SPAWN_REMOTE_IOCP_TOKEN: usize = 1;
 const FUTURE_NOTIFY_IOCP_TOKEN: usize = 2;
 
-type GlobalSpawn = Spawn<Box<Future<Item = (), Error = ()> + Send>>;
-
 impl Inner {
     // Drives a spawn by posting it to the IOCP as a custom item. The item may be run by any thread that
     // enters the IOCP.
-    fn spawn_remote(this: &Arc<Self>, spawn: GlobalSpawn) -> io::Result<()> {
+    fn spawn_remote(this: &Arc<Self>, future: Box<Future<Item = (), Error = ()> + Send>) -> io::Result<()> {
         let mut overlapped = Box::new(OverlappedSpawn {
             overlapped: Overlapped::zero(),
-            spawn: UnsafeCell::new(mem::ManuallyDrop::new(spawn)),
+            spawn: UnsafeCell::new(mem::ManuallyDrop::new(executor::spawn(future))),
             event_loop: this.clone(),
 
             future_refcount: AtomicUsize::new(1),
@@ -415,45 +412,13 @@ impl Inner {
             match completion.token() {
                 SPAWN_REMOTE_IOCP_TOKEN => unsafe {
                     let overlapped_spawn = &*(completion.overlapped() as *const OverlappedSpawn);
-                    let pre_notify = mem::ManuallyDrop::new(OverlappedSpawnIntoNotify(overlapped_spawn));
-
-                    let mut init_signal_level = overlapped_spawn.signal_level.load(Ordering::SeqCst); // TODO: weaken?
-                    loop {
-                        match (*overlapped_spawn.spawn.get()).poll_future_notify(&*pre_notify, 0) {
-                            Ok(Async::Ready(())) => {
-                                // Release reference to task
-                                overlapped_spawn.drop_future_ref();
-                                break;
-                            },
-                            Ok(Async::NotReady) => {
-                                // The future is waiting for something
-                                // We must make sure that no notifications were received while we were running Poll. If there were,
-                                // we poll again.
-                                // TODO: maybe try to re-poll a certain amount of times, and then put in queue to prevent blocking this
-                                // thread?
-                                // TODO: relax ordering?
-                                match overlapped_spawn.signal_level.compare_exchange(init_signal_level, 0, Ordering::SeqCst, Ordering::SeqCst) {
-                                    Ok(_) => break,
-                                    Err(level) => {
-                                        // Update notify count and retry
-                                        init_signal_level = level;
-                                        continue;
-                                    },
-                                }
-                            },
-                            Err(()) => {
-                                // Release reference to task
-                                overlapped_spawn.drop_future_ref();
-                                panic!("raw future in event loop resolved to an error");
-                            },
-                        }
-                    }
+                    overlapped_spawn.do_poll();
                 },
                 FUTURE_NOTIFY_IOCP_TOKEN => {
-                    // TODO: if notify acts on an OverlappedSpawn, move directly to polling that future. Otherwise every IO call
-                    // bounces off the IOCP twice.
-                    let overlapped_task = OverlappedTask(completion.overlapped() as *const _OverlappedTask);
-                    overlapped_task.inner().task.notify();
+                    IOCP_CURRENTLY_PROCESSING_EVENTS.set(self, || {
+                        let overlapped_task = OverlappedTask(completion.overlapped() as *const _OverlappedTask); // Submission to IO operation added a +1 to retain count
+                        overlapped_task.inner().task.notify();
+                    })
                 },
                 _ => panic!("unexpected IOCP token"),
             }
@@ -530,7 +495,7 @@ impl Inner {
 #[repr(C)] // Overlapped needs to have the same pointer as the overall structure
 struct OverlappedSpawn {
     overlapped: Overlapped,
-    spawn: UnsafeCell<mem::ManuallyDrop<GlobalSpawn>>,
+    spawn: UnsafeCell<mem::ManuallyDrop<Spawn<Box<Future<Item = (), Error = ()> + Send>>>>,
     event_loop: Arc<Inner>,
     // TODO: consider padding to cache lines to prevent false sharing
     future_refcount: AtomicUsize,
@@ -540,6 +505,10 @@ struct OverlappedSpawn {
 
 unsafe impl Send for OverlappedSpawn { }
 unsafe impl Sync for OverlappedSpawn { }
+
+scoped_thread_local! {
+    static IOCP_CURRENTLY_PROCESSING_EVENTS: Inner
+}
 
 impl OverlappedSpawn {
     #[inline]
@@ -569,14 +538,56 @@ impl OverlappedSpawn {
         // The last strong reference holds a reference to the wrapper
         self.drop_wrapper_ref();
     }
+
+    // WARNING: does not perform any synchronization internally. Ensure this is not called concurrently
+    unsafe fn do_poll(&self) {
+        let pre_notify = mem::ManuallyDrop::new(OverlappedSpawnIntoNotify(self));
+        let mut init_signal_level = self.signal_level.load(Ordering::SeqCst); // TODO: weaken?
+        loop {
+            match (*self.spawn.get()).poll_future_notify(&*pre_notify, 0) {
+                Ok(Async::Ready(())) => {
+                    // Release reference to task
+                    self.drop_future_ref();
+                    break;
+                },
+                Ok(Async::NotReady) => {
+                    // The future is waiting for something
+                    // We must make sure that no notifications were received while we were running Poll. If there were,
+                    // we poll again.
+                    // TODO: maybe try to re-poll a certain amount of times, and then put in queue to prevent blocking this
+                    // thread?
+                    // TODO: relax ordering?
+                    match self.signal_level.compare_exchange(init_signal_level, 0, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break,
+                        Err(level) => {
+                            // Update notify count and retry
+                            init_signal_level = level;
+                            continue;
+                        },
+                    }
+                },
+                Err(()) => {
+                    // Release reference to task
+                    self.drop_future_ref();
+                    panic!("raw future in event loop resolved to an error");
+                },
+            }
+        }
+    }
 }
 
 impl Notify for OverlappedSpawn {
     fn notify(&self, _id: usize) {
         // Signal level is 0 iff we are suspended. In that case it's our job to put the task back on the IOCP.
         if self.signal_level.fetch_add(1, Ordering::SeqCst) == 0 { // TODO: weaken ordering?
-            let completion = CompletionStatus::new(0, SPAWN_REMOTE_IOCP_TOKEN, &self.overlapped as *const Overlapped as *mut Overlapped);
-            self.event_loop.iocp.post(completion).expect("failed to post completion status to IOCP");
+            // Determine if this is being called by a thread inside turn() in response to an IO event. In that case, we poll immediately
+            // instead of bouncing off the IOCP and causing extra system calls (and possibly context switches)
+            if IOCP_CURRENTLY_PROCESSING_EVENTS.is_set() && IOCP_CURRENTLY_PROCESSING_EVENTS.with(|inner| inner as *const Inner == &*self.event_loop as *const Inner) {
+                unsafe { self.do_poll(); }
+            } else {
+                let completion = CompletionStatus::new(0, SPAWN_REMOTE_IOCP_TOKEN, &self.overlapped as *const Overlapped as *mut Overlapped);
+                self.event_loop.iocp.post(completion).expect("failed to post completion status to IOCP");
+            }
         }
     }
 }
@@ -612,7 +623,9 @@ impl Drop for OverlappedSpawnIntoNotify {
 impl Into<NotifyHandle> for OverlappedSpawnIntoNotify {
     fn into(self) -> NotifyHandle {
         // OverlappedSpawnIntoNotify already has a wrapper refcount if owned
-        unsafe { NotifyHandle::new(self.0 as *mut OverlappedSpawn) }
+        let handle = unsafe { NotifyHandle::new(self.0 as *mut OverlappedSpawn) };
+        mem::forget(self);
+        handle
     }
 }
 
