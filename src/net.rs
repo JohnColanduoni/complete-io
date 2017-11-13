@@ -31,6 +31,9 @@ pub trait TcpStream: Sized + AsyncRead + AsyncWrite + Clone + Send {
 
     fn connect(addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Self::Connect;
 
+    /// Starts a connection operation on an unconnected `TcpStream` (i.e. one produced via `net2::TcpBuilder`).
+    fn connect_with(stream: StdTcpStream, addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Self::Connect;
+
     fn from_stream(stream: StdTcpStream, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self>;
 
     fn local_addr(&self) -> Result<SocketAddr>;
@@ -70,9 +73,9 @@ macro_rules! make_net_tests {
         use ::queue::{EventQueue, Handle};
         use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket};
 
-        use std::thread;
+        use std::{thread, str};
         use std::time::Duration;
-        use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr};
+        use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, ToSocketAddrs};
 
         use futures::future;
         use net2::TcpBuilder;
@@ -143,7 +146,7 @@ macro_rules! make_net_tests {
             let server_thread = run_evloop_thread(&evloop, {
                 listener.accept().and_then(|(server, _)| {
                     server
-                        .read(BytesMut::from(vec![0u8; MESSAGE.len()]))
+                        .read(BytesMut::with_capacity(MESSAGE.len()))
                         .and_then(|(server, buffer, _bytes)| server.write(buffer.freeze()))
                 }).map(|_| ()).map_err(|err| panic!("{:?}", err))
             });
@@ -163,6 +166,23 @@ macro_rules! make_net_tests {
         }
 
         #[test]
+        fn http_remote() {
+            let mut evloop = $make_evloop;
+            let handle = evloop.handle();
+            let google_com_addr = "example.com:80".to_socket_addrs().unwrap().next().unwrap();
+
+            let (_, buffer, byte_count) = evloop.run(future::lazy(move || {
+                let request = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+                let buffer = BytesMut::with_capacity(8192);
+                TcpStream::connect(&google_com_addr, &handle)
+                    // TODO: write_all
+                    .and_then(|stream| stream.write(request))
+                    .and_then(|(stream, _, _)| stream.read(buffer))
+            })).unwrap();
+
+            assert!(str::from_utf8(&buffer).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+        }
+        #[test]
         fn udp_echo() {
             let mut evloop = $make_evloop;
             let handle = evloop.handle();
@@ -173,7 +193,7 @@ macro_rules! make_net_tests {
 
             let server_thread = run_evloop_thread(&evloop, {
                 server
-                    .recv_from(BytesMut::from(vec![0u8; MESSAGE.len()]))
+                    .recv_from(BytesMut::with_capacity(MESSAGE.len()))
                     .and_then(|(server, buffer, _bytes, remote_addr)| server.send_to(buffer.freeze(), &remote_addr))
                     .map(|_| ()).map_err(|err| panic!("{:?}", err))
             });

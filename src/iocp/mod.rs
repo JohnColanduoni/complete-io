@@ -71,6 +71,7 @@ impl EventQueue for CompletionPort {
 }
 
 impl Handle {
+    // TODO: SetFileNotification so we don't get extra IOCP events
     pub fn add_socket<S: AsRawSocket + ?Sized>(&self, socket: &S) -> io::Result<()> {
         self.inner.iocp.add_socket(FUTURE_NOTIFY_IOCP_TOKEN, socket)
     }
