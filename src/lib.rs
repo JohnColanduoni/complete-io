@@ -1,36 +1,23 @@
-#[macro_use] extern crate futures;
+extern crate futures;
 #[macro_use] extern crate log;
 extern crate bytes;
+#[macro_use] extern crate cfg_if;
 
-#[cfg(feature = "tokio")]
-extern crate tokio_core;
-#[cfg(feature = "tokio")]
-extern crate mio;
+cfg_if! { if #[cfg(all(feature = "iocp", target_os = "windows"))] {
+    extern crate miow;
+    #[macro_use] extern crate winhandle;
+    extern crate winapi;
+    extern crate kernel32;
+    extern crate ws2_32;
+    extern crate net2;
+} }
 
-#[cfg(all(feature = "iocp", target_os = "windows"))]
-#[macro_use] extern crate scoped_tls;
-#[cfg(all(feature = "iocp", target_os = "windows"))]
-extern crate miow;
-#[cfg(all(feature = "iocp", target_os = "windows"))]
-#[macro_use] extern crate winhandle;
-#[cfg(all(feature = "iocp", target_os = "windows"))]
-extern crate winapi;
-#[cfg(all(feature = "iocp", target_os = "windows"))]
-extern crate kernel32;
-#[cfg(all(feature = "iocp", target_os = "windows"))]
-extern crate ws2_32;
-#[cfg(all(feature = "iocp", target_os = "windows"))]
-extern crate net2;
-
-pub mod evloop;
+pub mod queue;
 #[macro_use] pub mod net;
 pub mod io;
-
-#[cfg(feature = "tokio")]
-pub mod tokio;
 
 #[cfg(all(feature = "iocp", target_os = "windows"))]
 pub mod iocp;
 
-pub use evloop::{EventLoop, ConcurrentEventLoop};
+pub use queue::{EventQueue};
 pub use io::{AsyncRead, AsyncWrite};

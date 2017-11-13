@@ -1,4 +1,4 @@
-use ::evloop::{EventLoop, ConcurrentEventLoop, AsRegistrar};
+use ::queue::{EventQueue};
 use ::io::*;
 
 use std::io::{Error, Result};
@@ -7,54 +7,46 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStr
 use futures::prelude::*;
 use bytes::{Bytes, BytesMut};
 
-pub trait TcpListener: Sized + Clone {
-    type EventLoop: EventLoop;
-    type TcpStream: TcpStream<EventLoop = Self::EventLoop>;
+pub trait TcpListener: Sized + Clone + Send {
+    type EventQueue: EventQueue;
+    type TcpStream: TcpStream<EventQueue = Self::EventQueue>;
 
     type Accept: Future<Item = (Self::TcpStream, SocketAddr), Error = Error>;
 
-    fn bind<R>(addr: &SocketAddr, handle: &R) -> Result<Self> where
-        R: AsRegistrar<Self::EventLoop>,
-    {
+    fn bind(addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self> {
         Self::from_listener(StdTcpListener::bind(addr)?, handle)
     }
 
-    fn from_listener<R>(listener: StdTcpListener, handle: &R) -> Result<Self> where
-        R: AsRegistrar<Self::EventLoop>;
+    fn from_listener(listener: StdTcpListener, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self>;
 
     fn accept(&self) -> Self::Accept;
 
     fn local_addr(&self) -> Result<SocketAddr>;
 }
 
-pub trait TcpStream: Sized + AsyncRead + AsyncWrite + Clone {
-    type EventLoop: EventLoop;
+pub trait TcpStream: Sized + AsyncRead + AsyncWrite + Clone + Send {
+    type EventQueue: EventQueue;
 
     type Connect: Future<Item = Self, Error = Error>;
 
-    fn connect<R>(addr: &SocketAddr, handle: &R) -> Self::Connect where
-        R: AsRegistrar<Self::EventLoop>;
+    fn connect(addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Self::Connect;
 
-    fn from_stream<R>(stream: StdTcpStream, handle: &R) -> Result<Self> where
-        R: AsRegistrar<Self::EventLoop>;
+    fn from_stream(stream: StdTcpStream, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self>;
 
     fn local_addr(&self) -> Result<SocketAddr>;
 }
 
-pub trait UdpSocket: Sized + Clone {
-    type EventLoop: EventLoop;
+pub trait UdpSocket: Sized + Clone + Send {
+    type EventQueue: EventQueue;
 
     type SendTo: Future<Item = (Self, Bytes), Error = Error> + Send + 'static;
     type RecvFrom: Future<Item = (Self, BytesMut, usize, SocketAddr), Error = Error> + Send + 'static;
     
-    fn bind<R>(addr: &SocketAddr, handle: &R) -> Result<Self> where
-        R: AsRegistrar<Self::EventLoop>,
-    {
+    fn bind(addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self> {
         Self::from_socket(StdUdpSocket::bind(addr)?, handle)
     }
 
-    fn from_socket<R>(socket: StdUdpSocket, handle: &R) -> Result<Self> where
-        R: AsRegistrar<Self::EventLoop>;
+    fn from_socket(socket: StdUdpSocket, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self>;
 
     fn local_addr(&self) -> Result<SocketAddr>;
 
@@ -65,27 +57,21 @@ pub trait UdpSocket: Sized + Clone {
     fn recv_from(self, buffer: BytesMut) -> Self::RecvFrom;
 }
 
-pub trait NetEventLoop: EventLoop {
-    type TcpListener: TcpListener<EventLoop = Self, TcpStream = Self::TcpStream>;
-    type TcpStream: TcpStream<EventLoop = Self>;
-    type UdpSocket: UdpSocket<EventLoop = Self>;
+pub trait NetEventQueue: EventQueue {
+    type TcpListener: TcpListener<EventQueue = Self, TcpStream = Self::TcpStream>;
+    type TcpStream: TcpStream<EventQueue = Self>;
+    type UdpSocket: UdpSocket<EventQueue = Self>;
 }
-
-pub trait ConcurrentNetEventLoop: ConcurrentEventLoop + NetEventLoop where
-    Self::TcpListener: Send,
-    Self::TcpStream: Send,
-    Self::UdpSocket: Send,
-    Self::Registrar: Send,
-    Self::RemoteHandle: AsRegistrar<Self>,
-{ }
 
 #[cfg(test)]
 macro_rules! make_net_tests {
     ($make_evloop:expr) => {
         #[allow(unused)]
-        use ::evloop::{EventLoop, RemoteHandle};
+        use ::queue::{EventQueue, Handle};
         use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket};
 
+        use std::thread;
+        use std::time::Duration;
         use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr};
 
         use futures::future;
@@ -148,14 +134,13 @@ macro_rules! make_net_tests {
 
         #[test]
         fn tcp_echo() {
-            let mut evloop = $make_evloop;
-            let remote = evloop.remote();
+            let evloop = $make_evloop;
             let handle = evloop.handle();
             let listener = TcpListener::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
             let mut listener_addr = listener.local_addr().unwrap();
             listener_addr.set_ip("127.0.0.1".parse().unwrap());
 
-            remote.spawn_fn(move |_| {
+            let server_thread = run_evloop_thread(&evloop, {
                 listener.accept().and_then(|(server, _)| {
                     server
                         .read(BytesMut::from(vec![0u8; MESSAGE.len()]))
@@ -163,14 +148,18 @@ macro_rules! make_net_tests {
                 }).map(|_| ()).map_err(|err| panic!("{:?}", err))
             });
 
-            evloop.run(future::lazy(|| {
+            thread::sleep(Duration::from_millis(10));
+
+            let client_thread = run_evloop_thread(&evloop, future::lazy(move || {
                 let connected = TcpStream::connect(&listener_addr, &handle);
                 connected.and_then(|client| {
                     client
                         .write(Bytes::from(MESSAGE.to_string().into_bytes()))
                         .and_then(|(client, buffer, _bytes)| client.read(buffer.try_mut().unwrap()))
                 })
-            })).unwrap();
+            }));
+            server_thread.join().unwrap().unwrap();
+            client_thread.join().unwrap().unwrap();
         }
 
         #[test]
@@ -182,19 +171,31 @@ macro_rules! make_net_tests {
             server_addr.set_ip("127.0.0.1".parse().unwrap());
             let client = UdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
 
-            evloop.remote().spawn_fn(move |_| {
+            let server_thread = run_evloop_thread(&evloop, {
                 server
                     .recv_from(BytesMut::from(vec![0u8; MESSAGE.len()]))
                     .and_then(|(server, buffer, _bytes, remote_addr)| server.send_to(buffer.freeze(), &remote_addr))
                     .map(|_| ()).map_err(|err| panic!("{:?}", err))
             });
-            evloop.turn(None);
+
+            thread::sleep(Duration::from_millis(10));
+
             evloop.run(future::lazy(|| {
                 client
                     .send_to(Bytes::from(MESSAGE.to_string().into_bytes()), &server_addr)
                     .and_then(|(client, buffer)| client.recv_from(buffer.try_mut().unwrap()))
             })).unwrap();
+
+            server_thread.join().unwrap().unwrap();
         }
 
+        fn run_evloop_thread<E: EventQueue + Send + Clone + 'static, F: Future + Send + 'static>(evloop: &E, future: F) -> thread::JoinHandle<::std::result::Result<F::Item, F::Error>> where
+            F::Item: Send, F::Error: Send,
+        {
+            let mut evloop = evloop.clone();
+            thread::spawn(move || {
+                evloop.run(future)
+            })
+        }
     }
 } 

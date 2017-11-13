@@ -1,208 +1,94 @@
 pub mod net;
 
-use ::evloop::{Registrar, AsRegistrar, EventLoop, ConcurrentEventLoop};
-use ::evloop::{LocalHandle as GenLocalHandle};
+use ::queue::{self, EventQueue, CustomEventHandler};
 
 use std::{io, mem};
-use std::marker::PhantomData;
-use std::cell::{UnsafeCell, RefCell};
-use std::collections::{VecDeque, HashMap};
-use std::sync::Arc;
-use std::sync::atomic::{self, AtomicUsize, AtomicBool,Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::os::windows::prelude::*;
 
-use futures::future;
 use futures::prelude::*;
 use futures::task::AtomicTask;
-use futures::executor::{self, Spawn, Notify, NotifyHandle, UnsafeNotify};
 use miow::Overlapped;
 use miow::iocp::{CompletionPort as RawCompletionPort, CompletionStatus};
-use winhandle::WinHandle;
 use winapi::*;
 use kernel32::*;
 use ws2_32::*;
 
+#[derive(Clone)]
 pub struct CompletionPort {
     inner: Arc<Inner>,
 }
 
 struct Inner {
     iocp: RawCompletionPort,
+    event_table: Mutex<Vec<Box<CustomEventHandler<CompletionPort>>>>,
 }
 
 #[derive(Clone)]
-pub struct LocalHandle {
-    remote: RemoteHandle,
-    _phantom: PhantomData<*mut ()>, // Prevent from being send
-}
-
-#[derive(Clone)]
-pub struct RemoteHandle {
+pub struct Handle {
     inner: Arc<Inner>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct EventTag {
+    callback_ptr: usize,
+    iocp_id: usize, // The ID is used to make sure we only queue custom events on the right CompletionPort
+}
+
 impl CompletionPort {
     pub fn new(max_concurrency: u32) -> io::Result<Self> {
         let inner = Arc::new(Inner {
             iocp: RawCompletionPort::new(max_concurrency)?,
+            event_table: Default::default(),
         });
 
         Ok(CompletionPort { inner })
     }
 }
 
-impl EventLoop for CompletionPort {
-    type LocalHandle = LocalHandle;
-    type RemoteHandle = RemoteHandle;
-    type Registrar = RemoteHandle;
+impl EventQueue for CompletionPort {
+    type Handle = Handle;
+    type EventTag = EventTag;
 
-    #[inline]
-    fn handle(&self) -> Self::LocalHandle {
-        LocalHandle {
-            remote: self.remote(),
-            _phantom: PhantomData,
+    fn handle(&self) -> Handle { Handle { inner: self.inner.clone() } }
+
+    fn turn(&mut self, max_wait: Option<Duration>) -> io::Result<usize> {
+        self.inner.poll_iocp(max_wait)
+    }
+
+    fn new_custom_event(&self, handler: CustomEventHandler<Self>) -> io::Result<Self::EventTag> {
+        let mut event_table = self.inner.event_table.lock().unwrap();
+        // We double box the handler so it can be posted as a single pointer
+        let handler_double_boxed = Box::new(handler);
+        let callback_ptr = &*handler_double_boxed as *const _ as usize;
+        event_table.push(handler_double_boxed);
+        Ok(EventTag {
+            callback_ptr,
+            iocp_id: self.inner.iocp.as_raw_handle() as usize,
+        })
+    }
+}
+
+impl Handle {
+    pub fn add_socket<S: AsRawSocket + ?Sized>(&self, socket: &S) -> io::Result<()> {
+        self.inner.iocp.add_socket(FUTURE_NOTIFY_IOCP_TOKEN, socket)
+    }
+}
+
+impl queue::Handle for Handle {
+    type EventQueue = CompletionPort;
+
+    fn post_custom_event(&self, event: EventTag, data: usize) -> io::Result<()> {
+        if event.iocp_id != self.inner.iocp.as_raw_handle() as usize {
+            panic!("the given EventTag is not for this IOCP");
         }
-    }
-
-    #[inline]
-    fn remote(&self) -> Self::RemoteHandle {
-        RemoteHandle {
-            inner: self.inner.clone(),
-        }
-    }
-
-    fn run<F>(&mut self, f: F) -> Result<F::Item, F::Error> where
-        F: Future,
-    {
-        self.inner.run_future(f)
-    }
-
-    fn turn(&mut self, max_wait: Option<Duration>) {
-        self.inner.poll_iocp(max_wait).expect("failed to poll IOCP");
+        self.inner.iocp.post(CompletionStatus::new(0, event.callback_ptr, data as _))
     }
 }
 
-impl ConcurrentEventLoop for CompletionPort {
-    fn run_concurrent<F>(&self, f: F) -> Result<F::Item, F::Error> where
-        F: Future + Send,
-    {
-        // TODO: allow the primary future to be run by any thread in the IOCP maybe?
-        self.inner.run_future(f)
-    }
-
-    fn turn_concurrent(&self, max_wait: Option<Duration>) {
-        self.inner.poll_iocp(max_wait).expect("failed to poll IOCP");
-    }
-
-    fn run_local<F, R>(&self, f: F) -> Result<R::Item, R::Error> where
-        F: FnOnce(&Self::LocalHandle) -> R,
-        R: IntoFuture,
-    {
-        let handle = self.handle();
-        self.inner.run_future(future::lazy(|| f(&handle)))
-    }
-}
-
-impl ::net::ConcurrentNetEventLoop for CompletionPort {
-}
-
-impl ::evloop::LocalHandle for LocalHandle {
-    type EventLoop = CompletionPort;
-
-    fn remote(&self) -> &RemoteHandle {
-        &self.remote
-    }
-
-    fn spawn<F>(&self, f: F) where
-        F: Future<Item = (), Error = ()> + 'static
-    {
-        LocalSpawn::new(&self.remote.inner, Box::new(f));
-    }
-
-    fn spawn_fn<F, R>(&self, f: F) where
-        F: FnOnce() -> R + 'static,
-        R: IntoFuture<Item = (), Error = ()> + 'static,
-    {
-        self.spawn(future::lazy(f));
-    }
-}
-
-impl AsRegistrar<CompletionPort> for LocalHandle {
-    fn as_registrar(&self) -> &RemoteHandle {
-        &self.remote
-    }
-}
-
-impl RemoteHandle {
-    /// Adds a WinSock socket to the IOCP.
-    pub fn add_socket<S>(&self, s: &S) -> io::Result<()> where S: AsRawSocket {
-        self.inner.iocp.add_socket(FUTURE_NOTIFY_IOCP_TOKEN, s)
-    }
-}
-
-impl ::evloop::RemoteHandle for RemoteHandle {
-    type EventLoop = CompletionPort;
-
-    fn local(&self) -> Option<LocalHandle> {
-        if self.inner.has_local_work_queue() {
-            Some(LocalHandle {
-                remote: self.clone(),
-                _phantom: PhantomData,
-            })
-        } else {
-            None
-        }
-    }
-
-    fn spawn_locked<F, R>(&self, f: F) where
-        F: FnOnce(&LocalHandle) -> R + Send + 'static,
-        R: IntoFuture<Item = (), Error = ()>,
-        R::Future: 'static,
-    {
-        let remote = self.clone();
-        self.spawn(future::lazy(move || {
-            let local = LocalHandle {
-                remote,
-                _phantom: PhantomData,
-            };
-
-            local.spawn(f(&local).into_future());
-
-            Ok(())
-        }))
-    }
-
-    fn spawn<F>(&self, f: F) where
-        F: Future<Item = (), Error = ()> + Send + 'static,
-    {
-        Inner::spawn_remote(&self.inner, Box::new(f)).expect("failed to queue future on IOCP");
-    }
-
-    fn spawn_fn<F, R>(&self, f: F) where
-        F: FnOnce(&LocalHandle) -> R + Send + 'static,
-        R: IntoFuture<Item = (), Error = ()>,
-        R::Future: Send + 'static,
-    {
-        let remote = self.clone();
-        self.spawn(future::lazy(move || {
-            let local = LocalHandle {
-                remote,
-                _phantom: PhantomData,
-            };
-
-            f(&local).into_future()
-        }))
-    }
-}
-
-impl Registrar for RemoteHandle {
-    type EventLoop = CompletionPort;
-}
-
-impl AsRegistrar<CompletionPort> for RemoteHandle {
-    fn as_registrar(&self) -> &RemoteHandle {
-        self
-    }
+impl queue::EventTag for EventTag {
+    type EventQueue = CompletionPort;
 }
 
 /// Allows overlapped IO operations to `notify` tasks.
@@ -212,52 +98,29 @@ impl AsRegistrar<CompletionPort> for RemoteHandle {
 /// overlapped will ensure the given task is notified when the operation completes. Note
 /// that you must ensure the IO object is added to the IOCP prior, or no notifications will
 /// be received.
-pub struct OverlappedTask(*const _OverlappedTask);
+#[derive(Clone)]
+pub struct OverlappedTask(Arc<_OverlappedTask>);
 
 #[repr(C)] // The pointer for Overlapped and _OverlappedTask must be the same
 struct _OverlappedTask {
     overlapped: Overlapped,
     task: AtomicTask,
-    // TODO: consider padding to cache lines to prevent false sharing
-    refcount: AtomicUsize,
-}
-
-unsafe impl Send for OverlappedTask {}
-unsafe impl Sync for OverlappedTask {}
-
-impl Drop for OverlappedTask {
-    fn drop(&mut self) {
-        if self.inner().refcount.fetch_sub(1, Ordering::Release) != 1 {
-            return;
-        }
-        atomic::fence(Ordering::Acquire);
-
-        unsafe { mem::drop(Box::from_raw(self.0 as *mut _OverlappedTask)) };
-    }
-}
-
-impl Clone for OverlappedTask {
-    fn clone(&self) -> Self {
-        self.inner().refcount.fetch_add(1, Ordering::Relaxed);
-        OverlappedTask(self.0)
-    }
 }
 
 impl OverlappedTask {
     /// Creates an `OverlappedTask` that will notify the current task.
-    pub fn new(_evloop: &RemoteHandle) -> OverlappedTask {
-        let overlapped = Box::new(_OverlappedTask {
+    pub fn new(_evloop: &Handle) -> OverlappedTask {
+        let overlapped = Arc::new(_OverlappedTask {
             overlapped: Overlapped::zero(),
             task: AtomicTask::new(),
-            refcount: AtomicUsize::new(1),
         });
         overlapped.task.register();
-        OverlappedTask(Box::into_raw(overlapped) as *const _OverlappedTask)
+        OverlappedTask(overlapped)
     }
 
     /// Alters the registered `Task` associated with this instance. This behaves like `AtomicTask::register`.
     pub fn register(&self) {
-        self.inner().task.register();
+        self.0.task.register();
     }
 
     /// Prepares the `OverlappedTask` for submission of an operation.
@@ -272,7 +135,7 @@ impl OverlappedTask {
     pub unsafe fn for_operation<F, R>(self, f: F) -> io::Result<R>
         where F: FnOnce(*mut OVERLAPPED) -> io::Result<R>
     {
-        let overlapped = self.inner().overlapped.raw();
+        let overlapped = self.0.overlapped.raw();
         match f(overlapped) {
             Ok(x) => {
                 mem::forget(self); // Hand our +1 refcount to the IOCP
@@ -283,14 +146,14 @@ impl OverlappedTask {
     }
 
     pub fn poll_socket<S: AsRawSocket>(&self, socket: &S) -> Poll<(usize, DWORD), io::Error> {
-        match unsafe { (*self.inner().overlapped.raw()).Internal as i32 } {
+        match unsafe { (*self.0.overlapped.raw()).Internal as i32 } {
             STATUS_PENDING => Ok(Async::NotReady),
             _ => {
                 let mut transferred: DWORD = 0;
                 let mut flags: DWORD = 0;
                 if unsafe { WSAGetOverlappedResult(
                     socket.as_raw_socket(),
-                    self.inner().overlapped.raw(),
+                    self.0.overlapped.raw(),
                     &mut transferred,
                     FALSE,
                     &mut flags,
@@ -304,68 +167,17 @@ impl OverlappedTask {
     }
 
     pub fn cancel_socket<S: AsRawSocket>(self, socket: &S) -> Result<(), (Self, io::Error)> {
-        unsafe { winapi_bool_call!(CancelIoEx(
+        unsafe { winapi_bool_call!(log: CancelIoEx(
             socket.as_raw_socket() as _,
-            self.inner().overlapped.raw(),
+            self.0.overlapped.raw(),
         )).map_err(|err| (self, err)) }
-    }
-
-    #[inline]
-    fn inner(&self) -> &_OverlappedTask {
-        unsafe { &*(self.0) }
     }
 }
 
-const SPAWN_REMOTE_IOCP_TOKEN: usize = 1;
-const FUTURE_NOTIFY_IOCP_TOKEN: usize = 2;
+const FUTURE_NOTIFY_IOCP_TOKEN: usize = 1;
 
 impl Inner {
-    // Drives a spawn by posting it to the IOCP as a custom item. The item may be run by any thread that
-    // enters the IOCP.
-    fn spawn_remote(this: &Arc<Self>, future: Box<Future<Item = (), Error = ()> + Send>) -> io::Result<()> {
-        let mut overlapped = Box::new(OverlappedSpawn {
-            overlapped: Overlapped::zero(),
-            spawn: UnsafeCell::new(mem::ManuallyDrop::new(executor::spawn(future))),
-            event_loop: this.clone(),
-
-            future_refcount: AtomicUsize::new(1),
-            wrapper_refcount: AtomicUsize::new(1),
-            signal_level: AtomicUsize::new(1),
-        });
-
-        let completion = CompletionStatus::new(0, SPAWN_REMOTE_IOCP_TOKEN, &mut overlapped.overlapped);
-        Box::into_raw(overlapped); // Do not free OVERLAPPED; this will be done when dequeued from IOCP
-        this.iocp.post(completion)?;
-
-        Ok(())
-    }
-
-    fn run_future<F>(&self, f: F) -> Result<F::Item, F::Error> where
-        F: Future,
-    {
-        let mut spawn = executor::spawn(f);
-        let notify = Arc::new(SimpleNotify {
-            notified: AtomicBool::new(true),
-        });
-
-        loop {
-            if notify.notified.swap(false, Ordering::SeqCst) { // TODO: relax ordering?
-                match spawn.poll_future_notify(&notify, 0) {
-                    Ok(Async::Ready(t)) => return Ok(t),
-                    Ok(Async::NotReady) => {},
-                    Err(err) => return Err(err),
-                }
-            }
-            self.poll_iocp(None).expect("failed to poll IOCP");
-        }
-    }
-
-    fn poll_iocp(&self, timeout: Option<Duration>) -> io::Result<()> {
-        // Clear local work queue
-        while let Some(spawn) = self.with_local_work_queue(|queue| queue.pop_front()) {
-            spawn.poll();
-        }
-
+    fn poll_iocp(&self, timeout: Option<Duration>) -> io::Result<usize> {
         // TODO: maybe dequeue multiple events?
         let mut completion_buffer: [CompletionStatus; 1];
         let completions;
@@ -389,16 +201,11 @@ impl Inner {
                 match error {
                     // Timeout is okay
                     WAIT_TIMEOUT if timeout.is_some() => {
-                        return Ok(());
+                        return Ok(0);
                     },
                     // Local tasks are queued as APCs, which will cause the call to be interrupted with WAIT_IO_COMPLETION
                     WAIT_IO_COMPLETION => {
-                        // Clear local work queue
-                        while let Some(spawn) = self.with_local_work_queue(|queue| queue.pop_front()) {
-                            spawn.poll();
-                        }
-
-                        return Ok(());
+                        unimplemented!()
                     },
                     error => {
                         return Err(io::Error::from_raw_os_error(error as i32));
@@ -410,406 +217,21 @@ impl Inner {
 
         for completion in completions.iter() {
             match completion.token() {
-                SPAWN_REMOTE_IOCP_TOKEN => unsafe {
-                    let overlapped_spawn = &*(completion.overlapped() as *const OverlappedSpawn);
-                    overlapped_spawn.do_poll();
-                },
                 FUTURE_NOTIFY_IOCP_TOKEN => {
-                    IOCP_CURRENTLY_PROCESSING_EVENTS.set(self, || {
-                        let overlapped_task = OverlappedTask(completion.overlapped() as *const _OverlappedTask); // Submission to IO operation added a +1 to retain count
-                        overlapped_task.inner().task.notify();
-                    })
+                    let overlapped_task = unsafe { Arc::from_raw(completion.overlapped() as *const _OverlappedTask) }; // Submission to IO operation added a +1 to retain count
+                    overlapped_task.task.notify();
                 },
-                _ => panic!("unexpected IOCP token"),
-            }
-        }
-
-        Ok(())
-    }
-
-    fn with_local_work_queue<F, R>(&self, f: F) -> R where
-        F: FnOnce(&mut VecDeque<LocalSpawn>) -> R,
-    {
-        LOCAL_WORK_QUEUE.with(|hashmap| {
-            let mut hashmap = hashmap.borrow_mut();
-            let queue = hashmap
-                .entry(self as *const Inner as usize)
-                .or_insert_with(|| Default::default());
-            f(queue)
-        })
-    }
-
-    fn has_local_work_queue(&self) -> bool {
-        LOCAL_WORK_QUEUE.with(|hashmap| {
-            hashmap.borrow().contains_key(&(self as *const Inner as usize))
-        })
-    }
-}
-
-// The life and times of an OverlappedSpawn deserves some mention. This
-// structure is the center of driving a Task which is not locked to a
-// particular IOCP thread.
-//
-// The task is always in one of the following states over its lifetime:
-//
-// * Suspened - The task is either waiting for a notification or has just been
-//              created but not yet placed in the IOCP.
-// * Queued   - The task is referenced by a CompletionStatus and will eventually
-//              be removed from the IOCP by a worker.
-// * Polling  - The task was removed from the IOCP and its poll is now running on
-//              the worker thread which removed it.
-// * Completed- The task has completed.
-//
-// The most complicated part of this lifecycle is notifications. Since a task may
-// subscribe to multiple notifications (and possible experience spruious wakeups)
-// they may happen at any one of these stages. If suspended, the task must be
-// placed onto the IOCP *exactly once* no matter how many notifications occur while 
-// it is suspended (otherwise it may be dequeued by multiple workers and polled 
-// concurrently, which is illegal). Notifications while queued must be handled in
-// the same way. Notifications while polling must cause the task to be polled again,
-// since the poll may have already passed over the state that the notification indicates
-// changed during the current iteration. Finally notifications while in the complete
-// state can be safely ignored, but the notification handles themselves may still be
-// present, preventing the overall structure from being dropped. An extra complication
-// for the completed state is the fact that the contained future is allowed to not be
-// of static type (e.g. if it was added by EventLoop::run_concurrent) so it *must* be
-// dropped before that stack frame is popped, while the notifications may still be live.
-//
-// There are a series of (wait-free) synchronization mechanisms employed to ensure proper
-// operation. First, we effectively have an Arc with weak pointers (we don't use the real
-// variant because of layout issues). The notification handles are weak, and there is only
-// at most one strong pointer that coincides with a pre-completed state. The task itself
-// is always dropped when the future is completed, but the structure as a whole will only
-// be dropped when all the notification handles are gone as well. To ensure proper
-// notification delivery, an atomic variable controls a sort of meta "signal level" state.
-// It is set to zero when suspended, and 1+ for queued or polling. Notifications always fetch_add
-// the signal level. If it was previously zero and the task is not completed, the task is put 
-// onto the IOCP by the notifier. Otherwise the notififier takes no other action. This takes care of the suspended
-// and queued states. For the polling case, the worker loads the signal level at the start
-// of the poll iteration. At the end it does a CAS, setting the value back to zero iff it
-// has not changed. This will be the case iff no notifications were delivered while polling.
-// Otherwise it repeats the same operation, ensuring that no notifications are lost. If a poll
-// leads to the completion of the future the signal level is not reset, causing late notifiers
-// to take no action (and therefore *not* put the task back on the IOCP). Otherwise it is set
-// to zero to enter the suspended state and await the first notification.
-#[repr(C)] // Overlapped needs to have the same pointer as the overall structure
-struct OverlappedSpawn {
-    overlapped: Overlapped,
-    spawn: UnsafeCell<mem::ManuallyDrop<Spawn<Box<Future<Item = (), Error = ()> + Send>>>>,
-    event_loop: Arc<Inner>,
-    // TODO: consider padding to cache lines to prevent false sharing
-    future_refcount: AtomicUsize,
-    wrapper_refcount: AtomicUsize, // The referrers of the future are counted as a single +1 wrapper refcount
-    signal_level: AtomicUsize,
-}
-
-unsafe impl Send for OverlappedSpawn { }
-unsafe impl Sync for OverlappedSpawn { }
-
-scoped_thread_local! {
-    static IOCP_CURRENTLY_PROCESSING_EVENTS: Inner
-}
-
-impl OverlappedSpawn {
-    #[inline]
-    unsafe fn add_wrapper_ref(&self) {
-        self.wrapper_refcount.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    unsafe fn drop_wrapper_ref(&self) {
-        // Only use an acquire fence if we are going to drop the struct
-        if self.wrapper_refcount.fetch_sub(1, Ordering::Release) != 1 {
-            return;
-        }
-        atomic::fence(Ordering::Acquire);
-        mem::drop(Box::from_raw(self as *const OverlappedSpawn as *mut OverlappedSpawn));
-    }
-
-    unsafe fn drop_future_ref(&self) {
-        // Only use an acquire fence if we are going to drop the struct
-        if self.future_refcount.fetch_sub(1, Ordering::Release) != 1 {
-            return;
-        }
-        atomic::fence(Ordering::Acquire);
-
-        mem::ManuallyDrop::drop(&mut *self.spawn.get());
-
-        // The last strong reference holds a reference to the wrapper
-        self.drop_wrapper_ref();
-    }
-
-    // WARNING: does not perform any synchronization internally. Ensure this is not called concurrently
-    unsafe fn do_poll(&self) {
-        let pre_notify = mem::ManuallyDrop::new(OverlappedSpawnIntoNotify(self));
-        let mut init_signal_level = self.signal_level.load(Ordering::SeqCst); // TODO: weaken?
-        loop {
-            match (*self.spawn.get()).poll_future_notify(&*pre_notify, 0) {
-                Ok(Async::Ready(())) => {
-                    // Release reference to task
-                    self.drop_future_ref();
-                    break;
-                },
-                Ok(Async::NotReady) => {
-                    // The future is waiting for something
-                    // We must make sure that no notifications were received while we were running Poll. If there were,
-                    // we poll again.
-                    // TODO: maybe try to re-poll a certain amount of times, and then put in queue to prevent blocking this
-                    // thread?
-                    // TODO: relax ordering?
-                    match self.signal_level.compare_exchange(init_signal_level, 0, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(_) => break,
-                        Err(level) => {
-                            // Update notify count and retry
-                            init_signal_level = level;
-                            continue;
-                        },
-                    }
-                },
-                Err(()) => {
-                    // Release reference to task
-                    self.drop_future_ref();
-                    panic!("raw future in event loop resolved to an error");
+                custom => {
+                    let callback = unsafe { &*(custom as *const CustomEventHandler<CompletionPort>) };
+                    let event_tag = EventTag {
+                        callback_ptr: custom,
+                        iocp_id: self.iocp.as_raw_handle() as usize,
+                    };
+                    callback(event_tag, completion.overlapped() as usize);
                 },
             }
         }
-    }
-}
 
-impl Notify for OverlappedSpawn {
-    fn notify(&self, _id: usize) {
-        // Signal level is 0 iff we are suspended. In that case it's our job to put the task back on the IOCP.
-        if self.signal_level.fetch_add(1, Ordering::SeqCst) == 0 { // TODO: weaken ordering?
-            // Determine if this is being called by a thread inside turn() in response to an IO event. In that case, we poll immediately
-            // instead of bouncing off the IOCP and causing extra system calls (and possibly context switches)
-            if IOCP_CURRENTLY_PROCESSING_EVENTS.is_set() && IOCP_CURRENTLY_PROCESSING_EVENTS.with(|inner| inner as *const Inner == &*self.event_loop as *const Inner) {
-                unsafe { self.do_poll(); }
-            } else {
-                let completion = CompletionStatus::new(0, SPAWN_REMOTE_IOCP_TOKEN, &self.overlapped as *const Overlapped as *mut Overlapped);
-                self.event_loop.iocp.post(completion).expect("failed to post completion status to IOCP");
-            }
-        }
-    }
-}
-
-unsafe impl UnsafeNotify for OverlappedSpawn {
-    unsafe fn clone_raw(&self) -> NotifyHandle {
-        self.add_wrapper_ref();
-        NotifyHandle::new(self as *const Self as *mut Self)
-    }
-
-    unsafe fn drop_raw(&self) {
-        self.drop_wrapper_ref();
-    }
-}
-
-struct OverlappedSpawnIntoNotify(*const OverlappedSpawn);
-
-impl Clone for OverlappedSpawnIntoNotify {
-    fn clone(&self) -> Self {
-        unsafe {
-            (*self.0).add_wrapper_ref();
-            OverlappedSpawnIntoNotify(self.0)
-        }
-    }
-}
-
-impl Drop for OverlappedSpawnIntoNotify {
-    fn drop(&mut self) {
-        unsafe { (*self.0).drop_wrapper_ref() }
-    }
-}
-
-impl Into<NotifyHandle> for OverlappedSpawnIntoNotify {
-    fn into(self) -> NotifyHandle {
-        // OverlappedSpawnIntoNotify already has a wrapper refcount if owned
-        let handle = unsafe { NotifyHandle::new(self.0 as *mut OverlappedSpawn) };
-        mem::forget(self);
-        handle
-    }
-}
-
-struct SimpleNotify {
-    notified: AtomicBool,
-}
-
-impl Notify for SimpleNotify {
-    fn notify(&self, _id: usize) {
-        self.notified.store(true, Ordering::SeqCst); // TODO: relax ordering?
-    }
-}
-
-
-thread_local! {
-    static LOCAL_WORK_QUEUE: RefCell<HashMap<usize, VecDeque<LocalSpawn>>> = Default::default();
-}
-
-// Tasks that are locked to a single thread must be handled differently from those that can migrate.
-// We can't put them on the IOCP, but we can use a less well known future called user APCs. This
-// allows us to queue arbitrary callbacks from any thread that will only be run on the given thread
-// during an "alertable wait". Conveniently enough GetQueuedCompletionStatusEx can perform such a
-// wait, and the APC will cause it to wake up.
-//
-// All notifications will have an Arc<_LocalSpawn>, but there should only ever be one LocalSpawn.
-struct LocalSpawn(Arc<_LocalSpawn>);
-
-struct _LocalSpawn {
-    thread: WinHandle,
-    evloop: Arc<Inner>,
-    future: UnsafeCell<Spawn<Box<Future<Item = (), Error = ()>>>>,
-    signal_level: AtomicUsize,
-}
-
-unsafe impl Send for _LocalSpawn {}
-unsafe impl Sync for _LocalSpawn {}
-
-impl LocalSpawn {
-    fn new(evloop: &Arc<Inner>, future: Box<Future<Item = (), Error = ()>>) {
-        let local_spawn = LocalSpawn(Arc::new(_LocalSpawn {
-            thread: unsafe { WinHandle::from_raw_unchecked(GetCurrentThread()) },
-            evloop: evloop.clone(),
-            future: UnsafeCell::new(executor::spawn(future)),
-            signal_level: AtomicUsize::new(1), // signal level is 1 because we will be placing on the queue immediately
-        }));
-        evloop.with_local_work_queue(|queue| queue.push_back(local_spawn));
-    }
-
-    fn poll(self) {
-        let mut init_signal_level = self.0.signal_level.load(Ordering::SeqCst); // TODO: relax ordering?
-        loop {
-            let future = unsafe { &mut *self.0.future.get() };
-            match future.poll_future_notify(&self.0, 0) {
-                Ok(Async::Ready(())) => {
-                    break;
-                },
-                Ok(Async::NotReady) => {
-                    // The future is waiting for something
-                    // We must make sure that no notifications were received while we were running Poll. If there were,
-                    // we poll again.
-                    // TODO: maybe try to re-poll a certain amount of times, and then put in queue to prevent blocking this
-                    // thread?
-                    // TODO: relax ordering?
-                    match self.0.signal_level.compare_exchange(init_signal_level, 0, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(_) => break,
-                        Err(level) => {
-                            // Update notify count and retry
-                            init_signal_level = level;
-                            continue;
-                        }
-                    }
-                },
-                Err(()) => {
-                    panic!("raw future in event loop resolved to an error");
-                },
-            }
-        }
-    }
-}
-
-impl Notify for _LocalSpawn {
-    fn notify(&self, _id: usize) {
-        if self.signal_level.fetch_add(1, Ordering::SeqCst) == 0 { // TODO: relax ordering?
-            unsafe {
-                // We need to send an Arc to the APC, but we don't want to drop ourselves. I don't love this :/
-                let self_arc = Arc::from_raw(self as *const _LocalSpawn);
-                let copy_arc = self_arc.clone();
-                mem::forget(self_arc);
-
-                if QueueUserAPC(
-                    Some(notify_local_work),
-                    self.thread.get(),
-                    Arc::into_raw(copy_arc) as _,
-                ) == 0 {
-                    let last_err = GetLastError();
-                    // ERROR_GEN_FAILURE is returned if the thread has terminated
-                    if last_err != ERROR_GEN_FAILURE {
-                        panic!("QueueUserAPC failed: {:?}", io::Error::from_raw_os_error(last_err as i32));
-                    }
-                }
-            }
-        }
-    }
-}
-
-unsafe extern "system" fn notify_local_work(param: ULONG_PTR) {
-    let local_spawn = Arc::from_raw(param as *const _LocalSpawn);
-    local_spawn.evloop.with_local_work_queue(|queue| {
-        queue.push_back(LocalSpawn(local_spawn.clone())) // TODO: get rid of extra clone somehow
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ::evloop::{RemoteHandle as GenRemoteHandle};
-
-    use std::thread;
-
-    use futures::{self, future};
-
-    #[test]
-    fn single_thread_remote_spawn() {
-        let iocp = CompletionPort::new(1).unwrap();
-        let x = Arc::new(AtomicUsize::new(0));
-        iocp.remote().spawn(future::lazy({
-            let x = x.clone();
-            move || {
-                x.store(1, Ordering::SeqCst);
-                Ok(())
-            }
-        }));
-        iocp.turn_concurrent(None);
-        assert_eq!(1, x.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn multithread_remote_spawn() {
-        let iocp = CompletionPort::new(1).unwrap();
-        let x = Arc::new(AtomicUsize::new(0));
-        iocp.remote().spawn(future::lazy({
-            let x = x.clone();
-            move || {
-                x.store(1, Ordering::SeqCst);
-                Ok(())
-            }
-        }));
-        thread::spawn(move || {
-            iocp.turn_concurrent(None);
-        }).join().unwrap();
-        assert_eq!(1, x.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn single_thread_local_spawn() {
-        let iocp = CompletionPort::new(1).unwrap();
-        let x = Arc::new(AtomicUsize::new(0));
-        iocp.handle().spawn(future::lazy({
-            let x = x.clone();
-            move || {
-                x.store(1, Ordering::SeqCst);
-                Ok(())
-            }
-        }));
-        iocp.turn_concurrent(Some(Duration::from_millis(1)));
-        assert_eq!(1, x.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn single_thread_local_notify() {
-        let iocp = CompletionPort::new(1).unwrap();
-        let x = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = futures::sync::oneshot::channel();
-        iocp.handle().spawn(future::lazy({
-            let x = x.clone();
-            move || {
-                rx.map(move |value| {
-                    x.store(value, Ordering::SeqCst);
-                }).map_err(|err| panic!("{:?}", err))
-            }
-        }));
-        iocp.turn_concurrent(Some(Duration::from_millis(1)));
-        tx.send(1).unwrap();
-        iocp.turn_concurrent(None);
-        assert_eq!(1, x.load(Ordering::SeqCst));
+        Ok(completions.len())
     }
 }

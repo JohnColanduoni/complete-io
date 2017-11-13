@@ -1,4 +1,3 @@
-use std::{io, mem};
 use std::io::Error;
 
 use futures::prelude::*;

@@ -1,6 +1,5 @@
-use ::evloop::{AsRegistrar};
-use ::iocp::{CompletionPort, RemoteHandle, OverlappedTask};
-use ::net::{NetEventLoop};
+use ::iocp::{CompletionPort, Handle, OverlappedTask};
+use ::net::{NetEventQueue};
 use ::io::*;
 
 use std::{mem, io};
@@ -23,7 +22,7 @@ pub struct TcpListener {
 
 struct _TcpListener {
     std: StdTcpListener,
-    evloop: RemoteHandle,
+    evloop: Handle,
     ip_version: IpVersion,
 }
 
@@ -40,7 +39,7 @@ pub struct TcpStream {
 
 struct _TcpStream {
     std: StdTcpStream,
-    evloop: RemoteHandle,
+    evloop: Handle,
 }
 
 #[derive(Clone)]
@@ -50,18 +49,15 @@ pub struct UdpSocket {
 
 struct _UdpSocket {
     std: StdUdpSocket,
-    evloop: RemoteHandle,
+    evloop: Handle,
 }
 
 impl ::net::TcpListener for TcpListener {
-    type EventLoop = CompletionPort;
+    type EventQueue = CompletionPort;
     type TcpStream = TcpStream;
     type Accept = Accept;
 
-    fn from_listener<R>(listener: StdTcpListener, handle: &R) -> Result<Self> where
-        R: AsRegistrar<CompletionPort>,
-    {
-        let handle = handle.as_registrar();
+    fn from_listener(listener: StdTcpListener, handle: &Handle) -> Result<Self> {
         handle.add_socket(&listener)?;
 
         let ip_version = if listener.local_addr()?.is_ipv4() {
@@ -134,14 +130,11 @@ impl TcpStream {
 }
 
 impl ::net::TcpStream for TcpStream {
-    type EventLoop = CompletionPort;
+    type EventQueue = CompletionPort;
 
     type Connect = Connect;
 
-    fn connect<R>(addr: &SocketAddr, handle: &R) -> Connect where
-        R: AsRegistrar<CompletionPort>,
-    {
-        let handle = handle.as_registrar();
+    fn connect(addr: &SocketAddr, handle: &Handle) -> Connect {
         let state = (|| {
             // Windows requires the socket be bound prior to connection
             let std_stream = if addr.is_ipv4() {
@@ -160,10 +153,7 @@ impl ::net::TcpStream for TcpStream {
         Connect { state }
     }
 
-    fn from_stream<R>(stream: StdTcpStream, handle: &R) -> Result<Self> where
-        R: AsRegistrar<CompletionPort>,
-    {
-        let handle = handle.as_registrar();
+    fn from_stream(stream: StdTcpStream, handle: &Handle) -> Result<Self> {
         handle.add_socket(&stream)?;
 
         Ok(TcpStream {
@@ -202,15 +192,12 @@ impl AsRawSocket for TcpStream {
 }
 
 impl ::net::UdpSocket for UdpSocket {
-    type EventLoop = CompletionPort;
+    type EventQueue = CompletionPort;
 
     type RecvFrom = RecvFrom;
     type SendTo = SendTo;
 
-    fn from_socket<R>(socket: StdUdpSocket, handle: &R) -> Result<Self> where
-        R: AsRegistrar<Self::EventLoop>,
-    {
-        let handle = handle.as_registrar();
+    fn from_socket(socket: StdUdpSocket, handle: &Handle) -> Result<Self> {
         handle.add_socket(&socket)?;
 
         Ok(UdpSocket {
@@ -248,7 +235,7 @@ impl AsRawSocket for UdpSocket {
     fn as_raw_socket(&self) -> SOCKET { self.inner.std.as_raw_socket() }
 }
 
-impl NetEventLoop for CompletionPort {
+impl NetEventQueue for CompletionPort {
     type TcpStream = TcpStream;
     type TcpListener = TcpListener;
     type UdpSocket = UdpSocket;
@@ -656,5 +643,5 @@ mod tests {
     use super::*;
     use ::iocp::CompletionPort;
 
-    make_net_tests!(CompletionPort::new(1).unwrap());
+    make_net_tests!(CompletionPort::new(4).unwrap());
 }
