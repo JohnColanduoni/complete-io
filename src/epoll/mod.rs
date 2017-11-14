@@ -1,16 +1,18 @@
 pub mod net;
 
 use ::queue::{self, EventQueue, CustomEventHandler};
+use ::io::{EventRegistrar, AsRegistrar};
 
-use std::{io, mem};
+use std::{io, mem, ptr};
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Weak, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::os::unix::prelude::*;
 
 use futures::prelude::*;
 use futures::task::AtomicTask;
+use crossbeam::sync::SegQueue;
 use libc;
 
 #[derive(Clone)]
@@ -24,10 +26,24 @@ pub struct Handle {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct EventTag();
+pub struct EventTag {
+    ptr: *const _CustomEvent,
+    epoll_fd: RawFd,
+}
+
+#[derive(Clone)]
+pub struct Interrupt(Arc<_Interrupt>);
+
+struct _Interrupt {
+    thread_id: AtomicUsize,
+}
+
+unsafe impl Send for EventTag {}
+unsafe impl Sync for EventTag {}
 
 struct Inner {
     fd: RawFd,
+    custom_events: Mutex<Vec<Box<_CustomEvent>>>,
 }
 
 impl Drop for Inner {
@@ -67,18 +83,122 @@ impl Epoll {
 
         Ok(Epoll { inner: Arc::new(Inner {
             fd,
+            custom_events: Default::default(),
         })})
     }
-
 }
 
 impl EventQueue for Epoll {
     type Handle = Handle;
     type EventTag = EventTag;
+    type Interrupt = Interrupt;
 
     fn handle(&self) -> Handle { Handle { inner: self.inner.clone(), } }
 
-    fn turn(&mut self, max_wait: Option<Duration>) -> io::Result<usize> {
+    fn turn(&self, max_wait: Option<Duration>) -> io::Result<usize> {
+        self.inner.poll(max_wait, None)
+    }
+
+    fn turn_interruptible(&self, max_wait: Option<Duration>, interrupt: &Interrupt) -> io::Result<usize> {
+        self.inner.poll(max_wait, Some(interrupt))
+    }
+
+    fn new_custom_event(&self, handler: CustomEventHandler<Self>) -> io::Result<Self::EventTag> {
+        let event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK | libc::EFD_SEMAPHORE) };
+        if event_fd == -1 {
+            let error = io::Error::last_os_error();
+            error!("eventfd failed: {}", error);
+            return Err(error);
+        }
+
+        let reg_handler = Arc::new(CustomEventRegistrationHandler {
+            event: UnsafeCell::new(ptr::null()),
+        });
+        let registration = unsafe { self.handle().register_fd_raw(event_fd, EventMask::READ, EventMode::ONE_SHOT, reg_handler.clone())? };
+
+        let event = Box::new(_CustomEvent {
+            handler,
+            event_fd,
+            registration,
+            queue: SegQueue::new(),
+        });
+        unsafe { *reg_handler.event.get() = &*event; }
+        let tag = EventTag {
+            ptr: &*event,
+            epoll_fd: self.inner.fd,
+        };
+
+        {
+            let mut custom_events = self.inner.custom_events.lock().unwrap();
+            custom_events.push(event);
+        }
+
+        Ok(tag)
+    }
+}
+
+impl EventRegistrar for Epoll {
+    type RegHandle = Handle;
+}
+
+impl Handle {
+    pub fn register_fd<F: AsRawFd + ?Sized>(&self, fd: &F, event_mask: EventMask, mode: EventMode, handler: Arc<RegistrationHandler>) -> io::Result<Registration> {
+        unsafe { self.register_fd_raw(fd.as_raw_fd(), event_mask, mode, handler) }
+    }
+
+    pub unsafe fn register_fd_raw(&self, fd: RawFd, event_mask: EventMask, mode: EventMode, handler: Arc<RegistrationHandler>) -> io::Result<Registration> {
+        let registration = Registration(Arc::new(_Registration {
+            fd,
+            queue: self.inner.clone(),
+            epoll_data: 0.into(),
+            handler,
+        }));
+        let mut event = libc::epoll_event {
+            events: event_mask.bits() | mode.bits(),
+            u64: mem::transmute::<Weak<_Registration>, usize>(Arc::downgrade(&registration.0)) as u64,
+        };
+        *registration.0.epoll_data.get() = event.u64;
+        if libc::epoll_ctl(self.inner.fd, libc::EPOLL_CTL_ADD, fd, &mut event) == -1 {
+            // Don't EPOLL_CTL_DEL
+            mem::drop(mem::transmute::<_, Weak<_Registration>>(event.u64));
+            mem::forget(Arc::try_unwrap(registration.0).unwrap_or_else(|_| unreachable!()));
+            let error = io::Error::last_os_error();
+            error!("adding via epoll_ctl failed: {}", error);
+            return Err(error);
+        } else {
+            Ok(registration)
+        }
+    }
+}
+
+impl AsRegistrar<Epoll> for Handle {
+    fn as_registrar(&self) -> &Self { self }
+}
+
+impl queue::Interrupt for Interrupt {
+    type EventQueue = Epoll;
+
+    fn new() -> Self {
+        Interrupt(Arc::new(_Interrupt {
+            thread_id: AtomicUsize::new(0),
+        }))
+    }
+
+    fn interrupt(&self) -> io::Result<bool> {
+        match self.0.thread_id.load(Ordering::SeqCst) { // TODO: weaken?
+            0 => Ok(false),
+            thread_id => {
+                match unsafe { libc::pthread_kill(thread_id as libc::pthread_t, libc::SIGUSR2) } {
+                    0 => Ok(true),
+                    err => Err(io::Error::from_raw_os_error(err)),
+                }
+            },
+        }
+    }
+}
+
+impl Inner {
+    fn poll(&self, max_wait: Option<Duration>, interrupt: Option<&Interrupt>) -> io::Result<usize> {
         let timeout_ms = if let Some(timeout) = max_wait {
             (timeout.as_secs() as u32 * 1000 + (timeout.subsec_nanos() / 1_000_000)) as i32
         } else {
@@ -88,17 +208,52 @@ impl EventQueue for Epoll {
         loop {
             unsafe {
                 let mut events: [libc::epoll_event; EVENT_BUFFER_SIZE] = mem::zeroed();
-                let event_count = match libc::epoll_wait(self.inner.fd, events.as_mut_ptr(), events.len() as _, timeout_ms) {
-                    -1 => {
-                        let error = io::Error::last_os_error();
-                        if error.kind() == io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        error!("epoll_wait failed: {}", error);
-                        return Err(error);
-                    },
-                    0 => return Ok(0),
-                    n => n as usize,
+                let event_count = if let Some(interrupt) = interrupt {
+                    let mut orig_sig_set: libc::sigset_t = mem::zeroed();
+                    let mut sig_set: libc::sigset_t = mem::zeroed();
+
+                    // Block SIGUSR2
+                    libc::sigemptyset(&mut sig_set);
+                    libc::sigaddset(&mut sig_set, libc::SIGUSR2);
+                    libc::sigprocmask(libc::SIG_BLOCK, &mut sig_set, &mut orig_sig_set);
+                    // Add our thread handle to interrupt
+                    interrupt.0.thread_id.store(libc::pthread_self() as usize, Ordering::SeqCst); // TODO: weaken?
+
+                    // Poll, only allowing SIGUSR2 to interrupt us
+                    let result = match libc::epoll_pwait(self.fd, events.as_mut_ptr(), events.len() as _, timeout_ms, &mut sig_set) {
+                        -1 => Err(io::Error::last_os_error()),
+                        n => Ok(n as usize),
+                    };
+
+                    // Remove our thread handle from interrupt
+                    interrupt.0.thread_id.store(0, Ordering::SeqCst); // TODO: weaken?
+                    // Restore signal mask
+                    libc::sigprocmask(libc::SIG_SETMASK, &mut orig_sig_set, ptr::null_mut());
+                    match result {
+                        Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {
+                            // We were interrupted via Interrupt
+                            return Ok(0);
+                        },
+                        Err(error) => {
+                            error!("epoll_wait failed: {}", error);
+                            return Err(error);
+                        },
+                        Ok(0) => return Ok(0),
+                        Ok(count) => count,
+                    }
+                } else {
+                    match libc::epoll_wait(self.fd, events.as_mut_ptr(), events.len() as _, timeout_ms) {
+                        -1 => {
+                            let error = io::Error::last_os_error();
+                            if error.kind() == io::ErrorKind::Interrupted { 
+                                continue;
+                            }
+                            error!("epoll_wait failed: {}", error);
+                            return Err(error);
+                        },
+                        0 => return Ok(0),
+                        n => n as usize,
+                    }
                 };
 
                 for event in events[0..event_count].iter() {
@@ -112,36 +267,6 @@ impl EventQueue for Epoll {
 
                 return Ok(event_count);
             }
-        }
-    }
-
-    fn new_custom_event(&self, handler: CustomEventHandler<Self>) -> io::Result<Self::EventTag> {
-        unimplemented!()
-    }
-}
-
-impl Handle {
-    pub fn register_fd<F: AsRawFd + ?Sized>(&self, fd: &F, event_mask: EventMask, mode: EventMode, handler: Arc<RegistrationHandler>) -> io::Result<Registration> {
-        let registration = Registration(Arc::new(_Registration {
-            fd: fd.as_raw_fd(),
-            queue: self.inner.clone(),
-            epoll_data: 0.into(),
-            handler,
-        }));
-        let mut event = libc::epoll_event {
-            events: event_mask.bits() | mode.bits(),
-            u64: unsafe { mem::transmute::<Weak<_Registration>, usize>(Arc::downgrade(&registration.0)) as u64 },
-        };
-        unsafe { *registration.0.epoll_data.get() = event.u64; }
-        if unsafe { libc::epoll_ctl(self.inner.fd, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), &mut event) } == -1 {
-            // Don't EPOLL_CTL_DEL
-            unsafe { mem::drop(mem::transmute::<_, Weak<_Registration>>(event.u64)) };
-            mem::forget(Arc::try_unwrap(registration.0).unwrap_or_else(|_| unreachable!()));
-            let error = io::Error::last_os_error();
-            error!("adding via epoll_ctl failed: {}", error);
-            return Err(error);
-        } else {
-            Ok(registration)
         }
     }
 }
@@ -298,6 +423,65 @@ impl queue::Handle for Handle {
     type EventQueue = Epoll;
 
     fn post_custom_event(&self, tag: <Self::EventQueue as EventQueue>::EventTag, data: usize) -> io::Result<()> {
-        unimplemented!()
+        if tag.epoll_fd != self.inner.fd {
+            panic!("the given EventTag is not from this Epoll instance");
+        }
+
+        let custom_event = unsafe { &*tag.ptr };
+
+        custom_event.queue.push(data);
+        
+        if unsafe { libc::write(custom_event.event_fd, &1u64 as *const u64 as _, 8) } == -1 {
+            let error = io::Error::last_os_error();
+            error!("write to signalfd for custom event failed: {}", error);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+}
+
+struct _CustomEvent {
+    handler: CustomEventHandler<Epoll>,
+    event_fd: RawFd,
+    registration: Registration,
+    queue: SegQueue<usize>,
+}
+
+impl Drop for _CustomEvent {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.event_fd); }
+    }
+}
+
+struct CustomEventRegistrationHandler {
+    event: UnsafeCell<*const _CustomEvent>,
+}
+
+impl RegistrationHandler for CustomEventRegistrationHandler {
+    fn handle_event(&self, registration: &Registration, _events: EventMask) {
+        let custom_event = unsafe { &**self.event.get() };
+
+        let mut count: u64 = 0;
+        if unsafe { libc::read(custom_event.event_fd, &mut count as *mut u64 as _, 8) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                count = 0;
+            } else {
+                panic!("read of eventfd failed: {}", error);
+            }
+        }
+
+        if count != 0 {
+            let event_tag = EventTag {
+                ptr: custom_event,
+                epoll_fd: custom_event.registration.0.queue.fd,
+            };
+            while let Some(data) = custom_event.queue.try_pop() {
+                (custom_event.handler)(event_tag, data);
+            }
+        }
+
+        registration.modify(EventMask::READ, EventMode::ONE_SHOT).expect("failed to re-arm eventfd for custom event");
     }
 }

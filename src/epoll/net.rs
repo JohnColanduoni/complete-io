@@ -1,5 +1,5 @@
 use super::{Epoll, Handle, FuturesRegistration, FutureInterest, EventMask};
-use ::io::{AsyncRead, AsyncWrite};
+use ::io::{AsyncRead, AsyncWrite, AsRegistrar};
 use ::net::{TcpStream as GenTcpStream};
 
 use std::{io, mem, slice};
@@ -24,11 +24,12 @@ struct _TcpListener {
 }
 
 impl ::net::TcpListener for TcpListener {
-    type EventQueue = Epoll;
+    type EventRegistrar = Epoll;
     type TcpStream = TcpStream;
     type Accept = Accept;
 
-    fn from_listener(listener: StdTcpListener, handle: &Handle) -> io::Result<Self> {
+    fn from_listener<R: AsRegistrar<Self::EventRegistrar>>(listener: StdTcpListener, handle: &R) -> io::Result<Self> {
+        let handle = handle.as_registrar();
         let registration = FuturesRegistration::new(handle, &listener)?;
         listener.set_nonblocking(true)?;
         Ok(TcpListener { inner: Arc::new(_TcpListener {
@@ -101,10 +102,10 @@ struct _TcpStream {
 }
 
 impl ::net::TcpStream for TcpStream {
-    type EventQueue = Epoll;
+    type EventRegistrar = Epoll;
     type Connect = Connect;
 
-    fn connect(addr: &SocketAddr, handle: &Handle) -> Self::Connect {
+    fn connect<R: AsRegistrar<Self::EventRegistrar>>(addr: &SocketAddr, handle: &R) -> Self::Connect {
         match (|| {
             let builder = if addr.is_ipv4() {
                 TcpBuilder::new_v4()?
@@ -118,7 +119,7 @@ impl ::net::TcpStream for TcpStream {
         }
     }
 
-    fn connect_with(stream: StdTcpStream, addr: &SocketAddr, handle: &Handle) -> Self::Connect {
+    fn connect_with<R: AsRegistrar<Self::EventRegistrar>>(stream: StdTcpStream, addr: &SocketAddr, handle: &R) -> Self::Connect {
         let state = match Self::from_stream(stream, handle) {
             Ok(stream) => ConnectState::Pending(stream, addr.clone(), None),
             Err(err) => ConnectState::Error(err),
@@ -126,7 +127,8 @@ impl ::net::TcpStream for TcpStream {
         Connect { state }
     }
 
-    fn from_stream(stream: StdTcpStream, handle: &Handle) -> io::Result<Self> {
+    fn from_stream<R: AsRegistrar<Self::EventRegistrar>>(stream: StdTcpStream, handle: &R) -> io::Result<Self> {
+        let handle = handle.as_registrar();
         let registration = FuturesRegistration::new(handle, &stream)?;
         stream.set_nonblocking(true)?;
         Ok(TcpStream { inner: Arc::new(_TcpStream {
@@ -309,12 +311,13 @@ struct _UdpSocket {
 }
 
 impl ::net::UdpSocket for UdpSocket {
-    type EventQueue = Epoll;
+    type EventRegistrar = Epoll;
 
     type SendTo = SendTo;
     type RecvFrom = RecvFrom;
 
-    fn from_socket(socket: StdUdpSocket, handle: &Handle) -> io::Result<Self> {
+    fn from_socket<R: AsRegistrar<Self::EventRegistrar>>(socket: StdUdpSocket, handle: &R) -> io::Result<Self> {
+        let handle = handle.as_registrar();
         let registration = FuturesRegistration::new(handle, &socket)?;
         socket.set_nonblocking(true)?;
         Ok(UdpSocket { inner: Arc::new(_UdpSocket {
@@ -436,13 +439,4 @@ impl ::net::NetEventQueue for Epoll {
     type TcpListener = TcpListener;
     type TcpStream = TcpStream;
     type UdpSocket = UdpSocket;
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ::epoll::Epoll;
-
-    make_net_tests!(Epoll::new().unwrap());
 }

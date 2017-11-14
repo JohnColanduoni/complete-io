@@ -1,4 +1,5 @@
 use ::queue::{EventQueue};
+use ::evloop::EventLoop;
 use ::io::*;
 
 use std::io::{Error, Result};
@@ -7,49 +8,49 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStr
 use futures::prelude::*;
 use bytes::{Bytes, BytesMut};
 
-pub trait TcpListener: Sized + Clone + Send {
-    type EventQueue: EventQueue;
-    type TcpStream: TcpStream<EventQueue = Self::EventQueue>;
+pub trait TcpListener: Sized + Clone + Send + 'static {
+    type EventRegistrar: EventRegistrar;
+    type TcpStream: TcpStream<EventRegistrar = Self::EventRegistrar>;
 
-    type Accept: Future<Item = (Self::TcpStream, SocketAddr), Error = Error>;
+    type Accept: Future<Item = (Self::TcpStream, SocketAddr), Error = Error> + Send + 'static;
 
-    fn bind(addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self> {
+    fn bind<R: AsRegistrar<Self::EventRegistrar>>(addr: &SocketAddr, handle: &R) -> Result<Self> {
         Self::from_listener(StdTcpListener::bind(addr)?, handle)
     }
 
-    fn from_listener(listener: StdTcpListener, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self>;
+    fn from_listener<R: AsRegistrar<Self::EventRegistrar>>(listener: StdTcpListener, handle: &R) -> Result<Self>;
 
     fn accept(&self) -> Self::Accept;
 
     fn local_addr(&self) -> Result<SocketAddr>;
 }
 
-pub trait TcpStream: Sized + AsyncRead + AsyncWrite + Clone + Send {
-    type EventQueue: EventQueue;
+pub trait TcpStream: Sized + AsyncRead + AsyncWrite + Clone + Send + 'static {
+    type EventRegistrar: EventRegistrar;
 
-    type Connect: Future<Item = Self, Error = Error>;
+    type Connect: Future<Item = Self, Error = Error> + Send + 'static;
 
-    fn connect(addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Self::Connect;
+    fn connect<R: AsRegistrar<Self::EventRegistrar>>(addr: &SocketAddr, handle: &R) -> Self::Connect;
 
     /// Starts a connection operation on an unconnected `TcpStream` (i.e. one produced via `net2::TcpBuilder`).
-    fn connect_with(stream: StdTcpStream, addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Self::Connect;
+    fn connect_with<R: AsRegistrar<Self::EventRegistrar>>(stream: StdTcpStream, addr: &SocketAddr, handle: &R) -> Self::Connect;
 
-    fn from_stream(stream: StdTcpStream, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self>;
+    fn from_stream<R: AsRegistrar<Self::EventRegistrar>>(stream: StdTcpStream, handle: &R) -> Result<Self>;
 
     fn local_addr(&self) -> Result<SocketAddr>;
 }
 
-pub trait UdpSocket: Sized + Clone + Send {
-    type EventQueue: EventQueue;
+pub trait UdpSocket: Sized + Clone + Send + 'static {
+    type EventRegistrar: EventRegistrar;
 
     type SendTo: Future<Item = (Self, Bytes), Error = Error> + Send + 'static;
     type RecvFrom: Future<Item = (Self, BytesMut, usize, SocketAddr), Error = Error> + Send + 'static;
     
-    fn bind(addr: &SocketAddr, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self> {
+    fn bind<R: AsRegistrar<Self::EventRegistrar>>(addr: &SocketAddr, handle: &R) -> Result<Self> {
         Self::from_socket(StdUdpSocket::bind(addr)?, handle)
     }
 
-    fn from_socket(socket: StdUdpSocket, handle: &<Self::EventQueue as EventQueue>::Handle) -> Result<Self>;
+    fn from_socket<R: AsRegistrar<Self::EventRegistrar>>(socket: StdUdpSocket, handle: &R) -> Result<Self>;
 
     fn local_addr(&self) -> Result<SocketAddr>;
 
@@ -61,161 +62,86 @@ pub trait UdpSocket: Sized + Clone + Send {
 }
 
 pub trait NetEventQueue: EventQueue {
-    type TcpListener: TcpListener<EventQueue = Self, TcpStream = Self::TcpStream>;
-    type TcpStream: TcpStream<EventQueue = Self>;
-    type UdpSocket: UdpSocket<EventQueue = Self>;
+    type TcpListener: TcpListener<EventRegistrar = Self, TcpStream = Self::TcpStream>;
+    type TcpStream: TcpStream<EventRegistrar = Self>;
+    type UdpSocket: UdpSocket<EventRegistrar = Self>;
+}
+
+pub trait NetEventLoop: EventLoop {
+    type TcpListener: TcpListener<EventRegistrar = Self::EventRegistrar, TcpStream = Self::TcpStream>;
+    type TcpStream: TcpStream<EventRegistrar = Self::EventRegistrar>;
+    type UdpSocket: UdpSocket<EventRegistrar = Self::EventRegistrar>;
 }
 
 #[cfg(test)]
-macro_rules! make_net_tests {
-    ($make_evloop:expr) => {
-        #[allow(unused)]
-        use ::queue::{EventQueue, Handle};
-        use ::net::{TcpListener as GenTcpListener, TcpStream as GenTcpStream, UdpSocket as GenUdpSocket};
+pub(crate) mod gen_tests {
+    use ::net::{NetEventLoop, TcpListener, TcpStream};
+    use ::io::{AsyncRead, AsyncWrite};
+    use ::evloop::{Handle, LocalHandle};
 
-        use std::{thread, str};
-        use std::time::Duration;
-        use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, ToSocketAddrs};
+    use std::{str};
+    use std::net::{ToSocketAddrs};
 
-        use futures::future;
-        use net2::TcpBuilder;
+    use futures::future;
+    use futures::prelude::*;
+    use bytes::{Bytes, BytesMut};
 
-        const MESSAGE: &str = "hello";
+    const MESSAGE: &str = "hello";
 
-        #[test]
-        fn accept_connect() {
-            let mut iocp = $make_evloop;
-            let handle = iocp.handle();
-            let listener = TcpListener::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
+    pub fn tcp_echo<L: NetEventLoop>(mut evloop: L) {
+        evloop.run(|handle| {
+            let listener = L::TcpListener::bind(&"0.0.0.0:0".parse().unwrap(), handle).unwrap();
             let mut listener_addr = listener.local_addr().unwrap();
             listener_addr.set_ip("127.0.0.1".parse().unwrap());
-            let ((_, remote_addr), client_side) = iocp.run(future::lazy(|| {
-                let accepted = listener.accept();
-                let connected = TcpStream::connect(&listener_addr, &handle);
-                accepted.join(connected)
-            })).unwrap();
-            assert_eq!(SocketAddr::V4(SocketAddrV4::new("127.0.0.1".parse().unwrap(), client_side.local_addr().unwrap().port())), remote_addr);
-        }
+            let client = L::TcpStream::connect(&listener_addr, handle);
 
-        #[test]
-        fn accept_connect_ipv6() {
-            let mut iocp = $make_evloop;
-            let handle = iocp.handle();
-            let listener = TcpBuilder::new_v6().unwrap()
-                .only_v6(true).unwrap()
-                .bind("[::]:0").unwrap()
-                .listen(8).unwrap();
-            let listener = TcpListener::from_listener(listener, &handle).unwrap();
-            let mut listener_addr = listener.local_addr().unwrap();
-            listener_addr.set_ip("::1".parse().unwrap());
-            let ((_, remote_addr), client_side) = iocp.run(future::lazy(|| {
-                let accepted = listener.accept();
-                let connected = TcpStream::connect(&listener_addr, &handle);
-                accepted.join(connected)
-            })).unwrap();
-            assert_eq!(SocketAddr::V6(SocketAddrV6::new("::1".parse().unwrap(), client_side.local_addr().unwrap().port(), 0, 0)), remote_addr);
-        }
-
-        #[test]
-        fn accept_connect_dual_stack() {
-            let mut iocp = $make_evloop;
-            let handle = iocp.handle();
-            let listener = TcpBuilder::new_v6().unwrap()
-                .only_v6(false).unwrap()
-                .bind("[::]:0").unwrap()
-                .listen(8).unwrap();
-            let listener = TcpListener::from_listener(listener, &handle).unwrap();
-            let mut listener_addr = listener.local_addr().unwrap();
-            listener_addr.set_ip("127.0.0.1".parse().unwrap());
-            let ((_, remote_addr), client_side) = iocp.run(future::lazy(|| {
-                let accepted = listener.accept();
-                let connected = TcpStream::connect(&listener_addr, &handle);
-                accepted.join(connected)
-            })).unwrap();
-            assert_eq!(SocketAddr::V6(SocketAddrV6::new(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped(), client_side.local_addr().unwrap().port(), 0, 0)), remote_addr);
-        }
-
-        #[test]
-        fn tcp_echo() {
-            let evloop = $make_evloop;
-            let handle = evloop.handle();
-            let listener = TcpListener::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
-            let mut listener_addr = listener.local_addr().unwrap();
-            listener_addr.set_ip("127.0.0.1".parse().unwrap());
-
-            let server_thread = run_evloop_thread(&evloop, {
+            handle.global().spawn(move |_| {
                 listener.accept().and_then(|(server, _)| {
                     server
                         .read(BytesMut::with_capacity(MESSAGE.len()))
                         .and_then(|(server, buffer, _bytes)| server.write(buffer.freeze()))
-                }).map(|_| ()).map_err(|err| panic!("{:?}", err))
+                }).map(|_| ()).map_err(|err| panic!("server error: {:?}", err))
             });
 
-            thread::sleep(Duration::from_millis(10));
-
-            let client_thread = run_evloop_thread(&evloop, future::lazy(move || {
-                let connected = TcpStream::connect(&listener_addr, &handle);
-                connected.and_then(|client| {
+            future::lazy(move || {
+                client.and_then(|client| {
                     client
                         .write(Bytes::from(MESSAGE.to_string().into_bytes()))
                         .and_then(|(client, buffer, _bytes)| client.read(buffer.try_mut().unwrap()))
                 })
-            }));
-            server_thread.join().unwrap().unwrap();
-            client_thread.join().unwrap().unwrap();
+            })
+        }).unwrap();
+    }
+
+    pub fn http_remote<L: NetEventLoop>(mut evloop: L) {
+        let google_com_addr = "example.com:80".to_socket_addrs().unwrap().next().unwrap();
+
+        let (_, buffer, _) = evloop.run(move |handle| {
+            let request = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let buffer = BytesMut::with_capacity(8192);
+            L::TcpStream::connect(&google_com_addr, handle)
+                // TODO: write_all
+                .and_then(|stream| stream.write(request))
+                .and_then(|(stream, _, _)| stream.read(buffer))
+
+        }).unwrap();
+
+        assert!(str::from_utf8(&buffer).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+}
+
+
+#[cfg(test)]
+macro_rules! make_net_loop_tests {
+    ($make_evloop:expr) => {
+        #[test]
+        fn tcp_echo() {
+            ::net::gen_tests::tcp_echo($make_evloop);
         }
 
         #[test]
         fn http_remote() {
-            let mut evloop = $make_evloop;
-            let handle = evloop.handle();
-            let google_com_addr = "example.com:80".to_socket_addrs().unwrap().next().unwrap();
-
-            let (_, buffer, byte_count) = evloop.run(future::lazy(move || {
-                let request = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
-                let buffer = BytesMut::with_capacity(8192);
-                TcpStream::connect(&google_com_addr, &handle)
-                    // TODO: write_all
-                    .and_then(|stream| stream.write(request))
-                    .and_then(|(stream, _, _)| stream.read(buffer))
-            })).unwrap();
-
-            assert!(str::from_utf8(&buffer).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
-        }
-        #[test]
-        fn udp_echo() {
-            let mut evloop = $make_evloop;
-            let handle = evloop.handle();
-            let server = UdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
-            let mut server_addr = server.local_addr().unwrap();
-            server_addr.set_ip("127.0.0.1".parse().unwrap());
-            let client = UdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), &handle).unwrap();
-
-            let server_thread = run_evloop_thread(&evloop, {
-                server
-                    .recv_from(BytesMut::with_capacity(MESSAGE.len()))
-                    .and_then(|(server, buffer, _bytes, remote_addr)| server.send_to(buffer.freeze(), &remote_addr))
-                    .map(|_| ()).map_err(|err| panic!("{:?}", err))
-            });
-
-            thread::sleep(Duration::from_millis(10));
-
-            evloop.run(future::lazy(|| {
-                client
-                    .send_to(Bytes::from(MESSAGE.to_string().into_bytes()), &server_addr)
-                    .and_then(|(client, buffer)| client.recv_from(buffer.try_mut().unwrap()))
-            })).unwrap();
-
-            server_thread.join().unwrap().unwrap();
-        }
-
-        fn run_evloop_thread<E: EventQueue + Send + Clone + 'static, F: Future + Send + 'static>(evloop: &E, future: F) -> thread::JoinHandle<::std::result::Result<F::Item, F::Error>> where
-            F::Item: Send, F::Error: Send,
-        {
-            let mut evloop = evloop.clone();
-            thread::spawn(move || {
-                evloop.run(future)
-            })
+            ::net::gen_tests::http_remote($make_evloop);
         }
     }
 } 
