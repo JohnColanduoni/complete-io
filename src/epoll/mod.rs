@@ -5,9 +5,10 @@ use ::io::{EventRegistrar, AsRegistrar};
 
 use std::{io, mem, ptr};
 use std::cell::UnsafeCell;
-use std::sync::{Arc, Weak, Mutex};
+use std::sync::{Arc, Weak, Mutex, Once, ONCE_INIT};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use std::os::raw::{c_int, c_void};
 use std::os::unix::prelude::*;
 
 use futures::prelude::*;
@@ -197,6 +198,26 @@ impl queue::Interrupt for Interrupt {
     }
 }
 
+static mut OLD_SIGUSR2_HANDLER: Option<libc::sigaction> = None;
+
+static SIGUSR2_INSTALL: Once = ONCE_INIT;
+
+unsafe extern "C" fn interrupt_sig_handler(signum: c_int, siginfo: *mut libc::siginfo_t, context: *mut c_void) {
+    if let Some(ref old_handler) = OLD_SIGUSR2_HANDLER {
+        if old_handler.sa_sigaction == libc::SIG_IGN || old_handler.sa_sigaction == libc::SIG_DFL {
+            return;
+        }
+
+        if old_handler.sa_flags & libc::SA_SIGINFO != 0 {
+            let fptr: unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) = mem::transmute(old_handler.sa_sigaction);
+            fptr(signum, siginfo, context);
+        } else {
+            let fptr: unsafe extern "C" fn(c_int) = mem::transmute(old_handler.sa_sigaction);
+            fptr(signum);
+        }
+    }
+}
+
 impl Inner {
     fn poll(&self, max_wait: Option<Duration>, interrupt: Option<&Interrupt>) -> io::Result<usize> {
         let timeout_ms = if let Some(timeout) = max_wait {
@@ -209,17 +230,25 @@ impl Inner {
             unsafe {
                 let mut events: [libc::epoll_event; EVENT_BUFFER_SIZE] = mem::zeroed();
                 let event_count = if let Some(interrupt) = interrupt {
-                    let mut orig_sig_set: libc::sigset_t = mem::zeroed();
-                    let mut sig_set: libc::sigset_t = mem::zeroed();
+                    // Install custom SIGUSR2 handler
+                    SIGUSR2_INSTALL.call_once(|| {
+                        let mut new_sigaction: libc::sigaction = mem::zeroed();
+                        let mut old_sigaction: libc::sigaction = mem::zeroed();
+                        new_sigaction.sa_sigaction = interrupt_sig_handler as usize;
+                        new_sigaction.sa_flags = libc::SA_SIGINFO;
+                        if libc::sigaction(libc::SIGUSR2, &new_sigaction, &mut old_sigaction) == -1 {
+                            panic!("sigaction failed to install SIGUSR2 handler");
+                        }
+                        OLD_SIGUSR2_HANDLER = Some(old_sigaction);
+                    });
 
-                    // Block SIGUSR2
-                    libc::sigemptyset(&mut sig_set);
-                    libc::sigaddset(&mut sig_set, libc::SIGUSR2);
-                    libc::sigprocmask(libc::SIG_BLOCK, &mut sig_set, &mut orig_sig_set);
                     // Add our thread handle to interrupt
                     interrupt.0.thread_id.store(libc::pthread_self() as usize, Ordering::SeqCst); // TODO: weaken?
 
                     // Poll, only allowing SIGUSR2 to interrupt us
+                    let mut sig_set: libc::sigset_t = mem::zeroed();
+                    libc::sigfillset(&mut sig_set);
+                    libc::sigdelset(&mut sig_set, libc::SIGUSR2);
                     let result = match libc::epoll_pwait(self.fd, events.as_mut_ptr(), events.len() as _, timeout_ms, &mut sig_set) {
                         -1 => Err(io::Error::last_os_error()),
                         n => Ok(n as usize),
@@ -227,8 +256,6 @@ impl Inner {
 
                     // Remove our thread handle from interrupt
                     interrupt.0.thread_id.store(0, Ordering::SeqCst); // TODO: weaken?
-                    // Restore signal mask
-                    libc::sigprocmask(libc::SIG_SETMASK, &mut orig_sig_set, ptr::null_mut());
                     match result {
                         Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {
                             // We were interrupted via Interrupt
@@ -484,4 +511,9 @@ impl RegistrationHandler for CustomEventRegistrationHandler {
 
         registration.modify(EventMask::READ, EventMode::ONE_SHOT).expect("failed to re-arm eventfd for custom event");
     }
+}
+
+#[cfg(test)]
+mod tests {
+    make_evqueue_tests!(::epoll::Epoll::new().unwrap());
 }

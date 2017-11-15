@@ -24,7 +24,7 @@ cfg_if! { if #[cfg(feature = "tokio")] {
     extern crate tokio_core;
 } }
 
-pub mod queue;
+#[macro_use] pub mod queue;
 #[macro_use] pub mod net;
 pub mod io;
 pub mod evloop;

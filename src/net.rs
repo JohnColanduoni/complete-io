@@ -130,6 +130,35 @@ pub(crate) mod gen_tests {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod gen_queue_tests {
+    use ::net::{NetEventQueue, TcpStream};
+    use ::io::{AsyncRead, AsyncWrite};
+
+    use std::{str};
+    use std::net::{ToSocketAddrs};
+
+    use bytes::{Bytes, BytesMut};
+    use futures::prelude::*;
+    use futures::future;
+
+    pub fn http_remote<Q: NetEventQueue>(evqueue: Q) {
+        let google_com_addr = "example.com:80".to_socket_addrs().unwrap().next().unwrap();
+
+        let handle = evqueue.handle();
+        let (_, buffer, _) = evqueue.run(future::lazy(move || {
+            let request = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let buffer = BytesMut::with_capacity(8192);
+            Q::TcpStream::connect(&google_com_addr, &handle)
+                // TODO: write_all
+                .and_then(|stream| stream.write(request))
+                .and_then(|(stream, _, _)| stream.read(buffer))
+        })).unwrap();
+
+        assert!(str::from_utf8(&buffer).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+}
+
 
 #[cfg(test)]
 macro_rules! make_net_loop_tests {
@@ -142,6 +171,16 @@ macro_rules! make_net_loop_tests {
         #[test]
         fn http_remote() {
             ::net::gen_tests::http_remote($make_evloop);
+        }
+    }
+} 
+
+#[cfg(test)]
+macro_rules! make_net_queue_tests {
+    ($make_evqueue:expr) => {
+        #[test]
+        fn http_remote() {
+            ::net::gen_queue_tests::http_remote($make_evqueue);
         }
     }
 } 

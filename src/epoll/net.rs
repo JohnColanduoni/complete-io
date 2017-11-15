@@ -440,3 +440,8 @@ impl ::net::NetEventQueue for Epoll {
     type TcpStream = TcpStream;
     type UdpSocket = UdpSocket;
 }
+
+#[cfg(test)]
+mod tests {
+    make_net_queue_tests!(::epoll::Epoll::new().unwrap());
+}

@@ -96,3 +96,47 @@ impl<Q: EventQueue> Notify for InterruptNotify<Q> {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod gen_tests {
+    use ::queue::{EventQueue, Interrupt};
+
+    use std::{thread};
+    use std::sync::{Arc, Barrier};
+
+    use futures;
+    use futures::prelude::*;
+
+    pub fn interrupt_thread<Q: EventQueue>(evqueue: Q) {
+        let evqueue = Arc::new(evqueue);
+        let interrupt = Q::Interrupt::new();
+        let (tx, rx) = futures::sync::oneshot::channel();
+        let barrier = Arc::new(Barrier::new(2));
+        let thread = thread::spawn({
+            let evqueue = evqueue.clone();
+            let interrupt = interrupt.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                evqueue.turn_interruptible(None, &interrupt).unwrap();
+                let _ = tx.send(());
+            }
+        });
+        barrier.wait();
+        let interrupted = interrupt.interrupt().unwrap();
+        assert!(interrupted);
+        rx.wait().unwrap();
+
+        thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+macro_rules! make_evqueue_tests {
+    ($make_evqueue:expr) => {
+        #[test]
+        fn interrupt_thread() {
+            ::queue::gen_tests::interrupt_thread($make_evqueue);
+        }
+    };
+}
